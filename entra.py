@@ -45,7 +45,7 @@ class EntraIDProvider:
         self,
         tenant_id: str,
         client_id: str,
-        client_secret: str,
+        client_secret: str | None,
         snowflake_scope_prefix: str,
         api_audience: str | None = None,
         service_principals: list[ServicePrincipal] | None = None,
@@ -54,7 +54,9 @@ class EntraIDProvider:
         key_resolver: KeyResolver | None = None,
         msal_app_factory: MsalAppFactory | None = None,
     ) -> None:
-        if not all((tenant_id, client_id, client_secret, snowflake_scope_prefix)):
+        # client_secret=None builds a validator only (no MSAL exchanges): used when
+        # AgentCore Identity holds the credentials, so no secret reaches this process.
+        if not all((tenant_id, client_id, snowflake_scope_prefix)) or client_secret == "":
             raise RuntimeError("Entra provider needs tenant id, client id, client secret and Snowflake scope prefix.")
         self.tenant_id = tenant_id
         self.client_id = client_id
@@ -77,7 +79,7 @@ class EntraIDProvider:
     # -- construction -------------------------------------------------------
 
     @classmethod
-    def from_env(cls) -> "EntraIDProvider":
+    def from_env(cls, *, validator_only: bool = False) -> "EntraIDProvider":
         try:
             raw = json.loads(os.environ.get("SERVICE_PRINCIPALS_JSON", "[]"))
             principals = [ServicePrincipal.model_validate(item) for item in raw]
@@ -86,7 +88,7 @@ class EntraIDProvider:
         return cls(
             tenant_id=os.environ.get("ENTRA_TENANT_ID", ""),
             client_id=os.environ.get("ENTRA_CLIENT_ID", ""),
-            client_secret=os.environ.get("ENTRA_CLIENT_SECRET", ""),
+            client_secret=None if validator_only else os.environ.get("ENTRA_CLIENT_SECRET", ""),
             snowflake_scope_prefix=os.environ.get("SNOWFLAKE_SCOPE_PREFIX", ""),
             api_audience=os.environ.get("ENTRA_API_AUDIENCE") or None,
             service_principals=principals,
@@ -115,6 +117,8 @@ class EntraIDProvider:
 
     def _platform(self) -> Any:
         # Only this API's own app registration is cached; its secret is fixed for the process.
+        if self._client_secret is None:
+            raise AuthError("This provider validates tokens only; it holds no client secret.")
         if self._platform_app is None:
             self._platform_app = self._msal_app_factory(self.client_id, self._client_secret)
         return self._platform_app
@@ -179,6 +183,18 @@ class EntraIDProvider:
         app = self._msal_app_factory(client_id, client_secret)
         result = app.acquire_token_for_client(scopes=[target])
         return self._to_token(result, (".default",), "Service principal authentication")
+
+    def validate_service_token(self, token: str) -> dict[str, Any]:
+        """An app-only token for this API: same signature, issuer, audience and
+        tenant checks as a user token. Needs the optional `idtyp` claim enabled
+        on the app registration; without it the token is refused."""
+        claims = self.validate_user_token(token)
+        if claims.get("idtyp") != "app":
+            raise AuthError("Token is not an app-only token.")
+        return claims
+
+    def exchange_service_token(self, client_id: str) -> DownstreamToken:
+        raise AuthError("Token-based job sign-in needs IDENTITY_PROVIDER=agentcore; use client credentials with this provider.")
 
     def service_principal(self, client_id: str) -> ServicePrincipal | None:
         return self._service_principals.get(client_id)

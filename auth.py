@@ -251,6 +251,10 @@ class IdentityProvider(Protocol):
 
     def acquire_service_token(self, client_id: str, client_secret: str) -> DownstreamToken: ...
 
+    def validate_service_token(self, token: str) -> dict[str, Any]: ...
+
+    def exchange_service_token(self, client_id: str) -> DownstreamToken: ...
+
     def service_principal(self, client_id: str) -> ServicePrincipal | None: ...
 
 
@@ -366,6 +370,31 @@ class SimulatedEntraID:
     def acquire_service_token(self, client_id: str, client_secret: str) -> DownstreamToken:
         return self._downstream(self.acquire_token_for_client(client_id, client_secret))
 
+    def issue_service_token(self, client_id: str, client_secret: str, ttl: int = TOKEN_TTL_SECONDS) -> str:
+        """Simulates a scheduler's client-credentials sign-in: an app-only
+        token for the platform API, which the job presents as its bearer token."""
+        sp = self._service_principals.get(client_id)
+        if sp is None or not hmac.compare_digest(sp.secret_sha256, self._hash(client_secret)):
+            raise AuthError("Service principal authentication failed.")
+        claims = self._base_claims(API_AUDIENCE, ttl) | {
+            "sub": sp.service_account_id, "oid": sp.service_account_id, "azp": client_id, "idtyp": "app",
+        }
+        return encode_jwt(claims, self._key)
+
+    def validate_service_token(self, token: str) -> dict[str, Any]:
+        return self.validate(token, API_AUDIENCE)
+
+    def exchange_service_token(self, client_id: str) -> DownstreamToken:
+        """Downstream token for a job whose own app-only token was just verified."""
+        sp = self._service_principals.get(client_id)
+        if sp is None:
+            raise AuthError("Service principal authentication failed.")
+        claims = self._base_claims(SNOWFLAKE_AUDIENCE) | {
+            "sub": sp.service_account_id, "oid": sp.service_account_id,
+            "azp": client_id, "idtyp": "app", "roles": [sp.execution_role],
+        }
+        return self._downstream(encode_jwt(claims, self._key))
+
 
 # ---------------------------------------------------------------------------
 # Demo tenant wiring (override secrets through the environment)
@@ -400,7 +429,7 @@ def _snowflake_role_for(app_roles: list[str]) -> str:
 
 
 def get_identity_provider() -> IdentityProvider:
-    """Provider named by IDENTITY_PROVIDER: `simulated` (default) or `entra`."""
+    """Provider named by IDENTITY_PROVIDER: `simulated` (default), `entra` or `agentcore`."""
     choice = os.environ.get("IDENTITY_PROVIDER", "simulated").lower()
     if choice == "simulated":
         return IDP
@@ -408,7 +437,11 @@ def get_identity_provider() -> IdentityProvider:
         from entra import EntraIDProvider  # imported lazily: needs msal and PyJWT
 
         return EntraIDProvider.from_env()
-    raise RuntimeError(f"Unknown IDENTITY_PROVIDER '{choice}' (use simulated or entra).")
+    if choice == "agentcore":
+        from agentcore_identity import AgentCoreIdentityProvider  # needs bedrock-agentcore
+
+        return AgentCoreIdentityProvider.from_env()
+    raise RuntimeError(f"Unknown IDENTITY_PROVIDER '{choice}' (use simulated, entra or agentcore).")
 
 
 ACTIVE_IDP: IdentityProvider = get_identity_provider()
@@ -420,6 +453,8 @@ def authenticate_user(user_jwt: str, idp: IdentityProvider | None = None) -> Aut
     idp = idp or ACTIVE_IDP
     try:
         claims = idp.validate_user_token(user_jwt)
+        if claims.get("idtyp") == "app":
+            raise AuthError("An app-only token cannot be used as a person.")
         upn = claims.get("upn")  # preferred_username is mutable and not safe for authorization
         oid = claims.get("oid")
         if not upn or not oid:
@@ -458,19 +493,57 @@ def authenticate_service(
     idp = idp or ACTIVE_IDP
     try:
         token = idp.acquire_service_token(client_id, client_secret)
-        sp = idp.service_principal(client_id)
-        if sp is None:
-            raise AuthError("Service principal is not registered with the platform.")
-        if airflow_dag_id not in sp.allowed_dag_ids:
-            raise AuthError(f"DAG '{airflow_dag_id}' is not permitted for this service principal.")
-        if not airflow_dag_run_id.strip():
-            raise AuthError("airflow_dag_run_id is required for headless execution.")
+        sp = _registered_job(idp, client_id, airflow_dag_id, airflow_dag_run_id)
     except AuthError as err:
         logger.warning(
             "auth.m2m.denied provider=%s client_id=%s airflow_dag_id=%s airflow_dag_run_id=%s reason=%s",
             idp.name, client_id, airflow_dag_id, airflow_dag_run_id, err,
         )
         raise
+    return _service_context(idp, sp, token, airflow_dag_id, airflow_dag_run_id)
+
+
+def authenticate_service_token(
+    service_jwt: str, airflow_dag_id: str, airflow_dag_run_id: str, idp: IdentityProvider | None = None,
+) -> AuthContext:
+    """Headless path for callers that sign in themselves (a scheduler calling
+    AgentCore Runtime): the job proves who it is with its own app-only token.
+    The service principal is taken from the verified token, never from the
+    request body, so naming a job does not make the caller that job."""
+    idp = idp or ACTIVE_IDP
+    client_id = ""
+    try:
+        claims = idp.validate_service_token(service_jwt)
+        if claims.get("idtyp") != "app" or claims.get("scp") or claims.get("upn"):
+            raise AuthError("Scheduled runs need an app-only token; a person's token cannot run a job.")
+        client_id = str(claims.get("azp") or claims.get("appid") or "")
+        sp = _registered_job(idp, client_id, airflow_dag_id, airflow_dag_run_id)
+        token = idp.exchange_service_token(client_id)
+    except AuthError as err:
+        logger.warning(
+            "auth.m2m.denied provider=%s client_id=%s airflow_dag_id=%s airflow_dag_run_id=%s reason=%s",
+            idp.name, client_id, airflow_dag_id, airflow_dag_run_id, err,
+        )
+        raise
+    ctx = _service_context(idp, sp, token, airflow_dag_id, airflow_dag_run_id)
+    job_expiry = datetime.fromtimestamp(claims["exp"], UTC)
+    return ctx.model_copy(update={"expires_at": min(ctx.expires_at, job_expiry)})
+
+
+def _registered_job(idp: IdentityProvider, client_id: str, airflow_dag_id: str, airflow_dag_run_id: str) -> ServicePrincipal:
+    sp = idp.service_principal(client_id)
+    if sp is None:
+        raise AuthError("Service principal is not registered with the platform.")
+    if airflow_dag_id not in sp.allowed_dag_ids:
+        raise AuthError(f"DAG '{airflow_dag_id}' is not permitted for this service principal.")
+    if not airflow_dag_run_id.strip():
+        raise AuthError("airflow_dag_run_id is required for headless execution.")
+    return sp
+
+
+def _service_context(
+    idp: IdentityProvider, sp: ServicePrincipal, token: DownstreamToken, airflow_dag_id: str, airflow_dag_run_id: str
+) -> AuthContext:
     ctx = AuthContext(
         auth_path=AuthPath.M2M,
         principal=sp.service_account_id,

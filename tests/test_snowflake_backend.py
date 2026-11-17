@@ -5,7 +5,7 @@ import decimal
 import pytest
 
 from auth import IDP, TOKEN_VAULT, AuthPath, TokenVault, authenticate_user
-from gates import DEFAULT_CATALOG, SQLSecurityError, sql_ast_gate
+from gates import DEFAULT_CATALOG, SQLSecurityError, SQLValidationError, sql_ast_gate
 from graph import AgentDeps, build_graph, run_query
 from schemas import DataDomain
 from snowflake_backend import (
@@ -89,7 +89,7 @@ def test_executor_refuses_before_connecting():
         executor("DELETE FROM SCADA.TELEMETRY_001", ctx, DEFAULT_CATALOG)
     with pytest.raises(PermissionError, match="outside the catalog"):
         executor("SELECT * FROM SECRET.PAYROLL", ctx, DEFAULT_CATALOG)
-    with pytest.raises(PermissionError, match="outside the catalog"):
+    with pytest.raises(SQLValidationError, match="SELECT list may contain only"):
         executor("SELECT CURRENT_USER()", ctx, DEFAULT_CATALOG)
     assert calls == []
 
@@ -161,8 +161,8 @@ def test_parenthesised_root_and_foreign_database_never_reach_the_warehouse():
 
 def test_executor_does_not_trust_a_cte_name_defined_elsewhere():
     ctx, calls = _operator(), []
-    shadow = ("SELECT (SELECT COUNT(*) FROM PAYROLL), w.work_order_id FROM MAINT.WORK_ORDERS_000 w "
-              "WHERE w.opened_at >= '2026-01-01' AND w.work_order_id IN (WITH PAYROLL AS (SELECT 1 AS a) SELECT a FROM PAYROLL)")
+    shadow = ("SELECT w.work_order_id FROM MAINT.WORK_ORDERS_000 w "
+              "WHERE w.opened_at >= '2026-01-01' AND w.work_order_id IN (SELECT work_order_id FROM PAYROLL) AND w.work_order_id IN (WITH PAYROLL AS (SELECT x.work_order_id FROM MAINT.WORK_ORDERS_000 x) SELECT work_order_id FROM PAYROLL)")
     with pytest.raises(PermissionError, match="outside the catalog"):
         SnowflakeExecutor(lambda c, t: calls.append(1) or FakeConn([TELEMETRY]))(shadow, ctx, DEFAULT_CATALOG)
     out = run_query(f"sql: {shadow}", ctx, build_graph(AgentDeps(executor=SnowflakeExecutor(lambda c, t: calls.append(1) or FakeConn([TELEMETRY])))))

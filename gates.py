@@ -10,6 +10,7 @@ Fail-closed rule: anything a gate cannot positively verify is REFUSED.
 """
 
 import math
+import re
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -261,6 +262,7 @@ def _check_expression_policy(root: exp.Expression) -> None:
         if ident.quoted:
             # A quoted name is a different, case-sensitive object in Snowflake.
             raise SQLValidationError(f"Quoted identifier \"{ident.name}\" is not allowed.")
+    _check_projection_policy(root)
     for column in root.find_all(exp.Column):
         name = column.name.upper()
         if column.args.get("db") or column.args.get("catalog"):
@@ -269,6 +271,184 @@ def _check_expression_policy(root: exp.Expression) -> None:
             raise SQLValidationError(f"'{column.sql()}' is not allowed in governed queries.")
         if not column.table and name.startswith("CURRENT_"):
             raise SQLValidationError(f"Session context value '{name}' is not on the allowed list.")
+
+
+# ---------------------------------------------------------------------------
+# Projection policy: what a query may return
+# ---------------------------------------------------------------------------
+# Result rows are released to the user as evidence. A SELECT list is therefore
+# an allow-list of shapes, not a deny-list of bad ones: a column, a star, one
+# of five aggregates over a column, ROUND of either, or DATE_TRUNC of a column.
+# Output names are derived from those shapes; an author cannot choose one.
+
+_AGGREGATES: dict[type[exp.Expression], tuple[str, ...]] = {
+    exp.Count: ("count",), exp.Sum: ("sum", "total"), exp.Avg: ("avg", "average", "mean"),
+    exp.Min: ("min",), exp.Max: ("max",),
+}
+_COUNT_STAR_NAMES = frozenset({"n", "count", "row_count", "total_rows"})
+_DATE_PARTS = frozenset({"year", "quarter", "month", "week", "day", "hour", "minute"})
+_TRUNC_TYPES: tuple[type[exp.Expression], ...] = tuple(
+    t for n in ("TimestampTrunc", "DateTrunc") if isinstance(t := getattr(exp, n, None), type)
+)
+_UNUSUAL_STRINGS: tuple[type[exp.Expression], ...] = tuple(
+    t for n in ("RawString", "HexString", "BitString", "ByteString", "National", "UnicodeString")
+    if isinstance(t := getattr(exp, n, None), type)
+)
+MAX_ROUND_DECIMALS = 6
+_PLAIN_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+_PROJECTION_RULE = (
+    "A SELECT list may contain only columns, *, COUNT/SUM/AVG/MIN/MAX of a column, ROUND of those, "
+    "and DATE_TRUNC of a column."
+)
+
+
+def _only_args(node: exp.Expression, *allowed: str) -> bool:
+    """True when the node carries nothing beyond the named arguments. An
+    argument this policy does not inspect is an argument it has not approved:
+    MIN(col, 'text') parses as an aggregate but executes as LEAST(col, 'text')."""
+    return all(key in allowed for key, value in node.args.items() if value not in (None, False, [], ""))
+
+
+def _plain_column(node: exp.Expression | None) -> str | None:
+    """The lower-case name of a plain column reference, else None."""
+    if isinstance(node, exp.Column) and isinstance(node.this, exp.Identifier) and _only_args(node, "this", "table"):
+        return node.name.lower()
+    return None
+
+
+def _projection_names(value: exp.Expression) -> frozenset[str] | None:
+    """Output names an allowed SELECT-list expression may carry (empty: it may
+    not be renamed). None when the expression is not an allowed shape."""
+    if isinstance(value, exp.Star) or (isinstance(value, exp.Column) and isinstance(value.this, exp.Star)):
+        star = value if isinstance(value, exp.Star) else value.this
+        modifiers = [k for k, v in star.args.items() if v]
+        return None if modifiers else frozenset()  # no EXCLUDE / REPLACE / RENAME
+    if (column := _plain_column(value)) is not None:
+        return frozenset({column})
+    if isinstance(value, exp.Round):
+        if not _only_args(value, "this", "decimals", "casts_non_integer_decimals"):
+            return None
+        decimals = value.args.get("decimals")
+        if decimals is not None and not (
+            isinstance(decimals, exp.Literal) and decimals.is_int and 0 <= int(decimals.this) <= MAX_ROUND_DECIMALS
+        ):
+            return None
+        inner = value.this
+        if isinstance(inner, exp.Round) or isinstance(inner, _TRUNC_TYPES):
+            return None
+        return _projection_names(inner)
+    if type(value) in _AGGREGATES:
+        prefixes, target = _AGGREGATES[type(value)], value.this
+        if not _only_args(value, "this", "big_int"):
+            return None  # extra arguments turn MIN/MAX into LEAST/GREATEST
+        if isinstance(value, exp.Count) and isinstance(target, exp.Star):
+            return _COUNT_STAR_NAMES if _only_args(target) else None
+        if isinstance(value, exp.Count) and isinstance(target, exp.Distinct):
+            if len(target.expressions) != 1 or not _only_args(target, "expressions"):
+                return None
+            target = target.expressions[0]
+        column = _plain_column(target)
+        if column is None:
+            return None
+        return frozenset({f"{p}_{column}" for p in prefixes} | {f"{column}_{p}" for p in prefixes})
+    if isinstance(value, _TRUNC_TYPES):
+        if not _only_args(value, "this", "unit", "input_type_preserved"):
+            return None
+        column, unit = _plain_column(value.this), value.args.get("unit")
+        part = unit.name.lower() if isinstance(unit, (exp.Var, exp.Literal)) else ""
+        if column is None or part not in _DATE_PARTS:
+            return None
+        # Never the bare column name: a timestamp cut to the year must not be labelled as the timestamp.
+        return frozenset({part, f"{part}_{column}", f"{column}_{part}"})
+    return None
+
+
+def _check_projection_policy(root: exp.Expression) -> None:
+    """Every value a query returns must be table data under a name the
+    author did not choose. Applies to every SELECT in the statement, so a
+    CTE or subquery cannot be used to manufacture a value or a name."""
+    for node in root.find_all(*_UNUSUAL_STRINGS):
+        raise SQLValidationError("Only ordinary quoted strings are allowed.")
+    for alias in root.find_all(exp.TableAlias):
+        if alias.args.get("columns"):
+            raise SQLValidationError("Column lists on a CTE or subquery are not allowed; they rename outputs.")
+    for node in root.find_all(exp.SetOperation):
+        # A set operation relabels values by position (a MIN released under the first branch's
+        # MAX name) and lets the number of branches decide what an outer COUNT returns.
+        raise SQLValidationError("UNION, INTERSECT and EXCEPT are not allowed in governed queries.")
+    for node in root.walk():
+        if node is not root and any(node.args.get(key) is not None for key in ("limit", "offset", "fetch")):
+            # A row cap inside a subquery is the direct way to pick what an outer COUNT returns.
+            # (A determined author can still shape a count with WHERE filters; that is a
+            # documented limitation, not something this rule claims to prevent.)
+            raise SQLValidationError("LIMIT is only allowed on the outermost query.")
+        if node.args.get("qualify") is not None:
+            raise SQLValidationError("QUALIFY is not allowed in governed queries.")
+        if isinstance(node, exp.Distinct) and node.args.get("on") is not None:
+            raise SQLValidationError("DISTINCT ON is not allowed in governed queries.")
+        if isinstance(node, exp.Join) and not isinstance(node.parent, exp.Select):
+            # A join inside parentheses hangs off the table, where the key check would not see it.
+            raise SQLValidationError("Parenthesised joins are not allowed; write joins directly in the FROM clause.")
+    if root.args.get("offset") is not None or root.args.get("fetch") is not None:
+        raise SQLValidationError("OFFSET and FETCH are not allowed; use LIMIT.")
+    for ident in root.find_all(exp.Identifier, exp.Var):
+        # Plain names only: look-alike letters fold to real names, and control characters hide in them.
+        if not _PLAIN_NAME.fullmatch(ident.name):
+            raise SQLValidationError("Names and keywords must be plain ASCII letters, digits and underscores.")
+    for group in root.find_all(exp.Group):
+        # GROUPING SETS, ROLLUP and CUBE add rows that do not depend on the data, so an outer
+        # aggregate over them returns a number the author picked.
+        if not _only_args(group, "expressions"):
+            raise SQLValidationError("GROUP BY may list only columns, positions and DATE_TRUNC of a column.")
+        for item in group.expressions:
+            position = isinstance(item, exp.Literal) and item.is_int
+            if not position and _plain_column(item) is None and not (isinstance(item, _TRUNC_TYPES) and _projection_names(item)):
+                raise SQLValidationError("GROUP BY may list only columns, positions and DATE_TRUNC of a column.")
+    for select in root.find_all(exp.Select):
+        if not _only_args(select, "expressions", "from_", "from", "joins", "where", "group", "having", "order", "limit", "with_", "with", "distinct"):
+            raise SQLValidationError("That SELECT clause is not allowed in governed queries.")
+        seen: set[str] = set()
+        for projection in select.expressions:
+            names = _projection_names(projection.unalias())
+            if names is None:
+                raise SQLValidationError(_PROJECTION_RULE)
+            value = projection.unalias()
+            alias = projection.alias.lower() if isinstance(projection, exp.Alias) else ""
+            allowed = ", ".join(sorted(names)[:4]) or "no alias"
+            if alias and alias not in names:
+                raise SQLValidationError(f"Output name '{alias[:40]}' is not allowed here; use one of: {allowed}.")
+            if not alias and names and _plain_column(value) is None:
+                # An unnamed expression is named after its own text by the warehouse, and that
+                # text includes the author's table alias. So every computed output must be named.
+                raise SQLValidationError(f"Name this output with AS, using one of: {allowed}.")
+            output = alias or _plain_column(value)
+            if output:
+                if output in seen:
+                    raise SQLValidationError(f"Output name '{output}' is used twice.")
+                seen.add(output)
+
+
+class ResultShapeError(RuntimeError):
+    """The warehouse returned a column the validated query could not have produced."""
+
+
+def check_result_columns(sql: str, rows: list[dict[str, Any]], catalog: "Catalog") -> None:
+    """Second line of defence behind the projection policy, applied to what
+    actually came back. Every column in a result must be a catalog column of a
+    table the query reads or one of the query's own (validated, derived)
+    output names. Anything else means the query produced a name the policy
+    did not foresee, and the result is not released."""
+    root = sqlglot.parse_one(sql, read=SQL_DIALECT)
+    allowed = {"_table"}
+    for table in root.find_all(exp.Table):
+        spec = resolve_table(table, catalog)
+        if spec is not None:
+            allowed.update(column.lower() for column in spec.columns)
+    allowed.update(alias.alias.lower() for alias in root.find_all(exp.Alias) if alias.alias)
+    for row in rows:
+        unexpected = [key for key in row if str(key).lower() not in allowed]
+        if unexpected:
+            raise ResultShapeError(f"{len(unexpected)} unexpected output column(s) in the result.")
 
 
 def parse_read_only_sql(sql: str) -> exp.Expression:
@@ -309,6 +489,15 @@ def parse_read_only_sql(sql: str) -> exp.Expression:
         )
     try:
         _check_expression_policy(root)
+        # What executes is the SQL re-serialised from this tree, and the generator can rewrite
+        # constructs (MIN with two arguments becomes LEAST). So the policy is applied a second
+        # time to exactly what would be sent to the warehouse.
+        emitted = sqlglot.parse(root.sql(dialect=SQL_DIALECT), read=SQL_DIALECT)
+        if len(emitted) != 1 or type(emitted[0]) is not type(root):
+            raise SQLValidationError("The query changes shape when it is normalised.")
+        _check_expression_policy(emitted[0])
+    except SqlglotError as err:
+        raise SQLValidationError("The query could not be normalised.") from err
     except RecursionError as err:
         raise SQLValidationError("SQL is nested too deeply to validate.") from err
     return root

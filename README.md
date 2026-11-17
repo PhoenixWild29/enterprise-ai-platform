@@ -4,7 +4,28 @@ Multi-agent LangGraph workflow over a governed Snowflake lakehouse (500-table
 catalog: SCADA telemetry, maintenance, finance) with fail-closed validation
 gates. Python 3.12, LangGraph, Pydantic v2, sqlglot, FastAPI.
 
-## Flow
+## Two runtimes, one set of gates
+
+| Runtime | Entry point | Orchestration | Use |
+| --- | --- | --- | --- |
+| Amazon Bedrock AgentCore | `agentcore_app.py` (`POST /invocations`) | One Strands agent with gated tools (`strands_agent.py`) | The target deployment |
+| FastAPI | `main.py` | LangGraph supervisor and specialists (`graph.py`) | Local development, CI, the evaluation harness, durable human review |
+
+The guarantees do not live in either orchestrator. They live in `gates.py` and in the tools in
+`platform_tools.py`, which both runtimes call. The MCP server (`mcp_server.py`) exposes the same tools.
+
+### How it maps to AgentCore
+
+| AgentCore component | In this repository |
+| --- | --- |
+| Runtime | `agentcore_app.py`, `Dockerfile`, `infra/terraform` |
+| Gateway (MCP tools) | `mcp_server.py`: `find_tables`, `search_manuals`, `run_sql`, each run as the caller |
+| Identity | `agentcore_identity.py`: on-behalf-of exchange for users; scheduled jobs present their own app-only token and get a machine-flow token for their one role |
+| Memory | `memory.py`: session, user, persona and organisation scopes with a write policy and review; `AgentCoreMemoryStore` |
+| Observability | `telemetry.py`: both runtimes emit one trace per run from the audit trail, over OTLP when an endpoint is set. Spans carry decisions and counts, never query text, SQL, gate messages or a person's identity |
+| Models | `bedrock_models.py`: Bedrock Converse, per-role model portfolio, token budgets, cost metering |
+
+## Flow (LangGraph runtime)
 
 ```
 START -> auth_gate -> supervisor_router
@@ -28,6 +49,15 @@ output node. A citation failure on the user path pauses for human review.
 | `graph.py` | LangGraph `StateGraph`, injectable agent dependencies |
 | `llm_agents.py` | Model-backed router, Text-to-SQL (schema retrieval, gate-driven repair) and synthesizer |
 | `persistence.py` | Checkpointer selection: SQLite, Postgres or memory |
+| `platform_tools.py` | The gated tools shared by the Strands agent and the MCP server; per-request evidence ledger |
+| `strands_agent.py` | Strands agent: gated tools, security halt hook, structured evidence output, extractive answer |
+| `agentcore_app.py` | AgentCore Runtime entrypoint for user and scheduled invocations |
+| `agentcore_identity.py` | Identity provider backed by AgentCore Identity |
+| `bedrock_models.py` | Bedrock model access, model portfolio by role, request budgets, usage and cost metering |
+| `memory.py` | Governed memory: scopes, write policy, review of shared memory, retention |
+| `mcp_server.py` | MCP server exposing the gated tools with bearer-token authentication |
+| `telemetry.py` | OpenTelemetry export of the audit trail |
+| `anomaly.py` | Classical anomaly detection (robust z-score) for sensor readings |
 | `snowflake_backend.py` | Snowflake executor (caller's own OAuth token), catalog loader from Snowflake metadata |
 | `retrieval.py` | Vector index, offline embedder, Snowflake Cortex vector retriever |
 | `runtime.py` | Assembles agents, warehouse, retriever and catalog from the environment |
@@ -37,7 +67,7 @@ output node. A citation failure on the user path pauses for human review.
 ## Run
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pytest -q                      # unit, graph, API, provider and persistence tests
 python eval_harness.py         # both evaluation tiers
 uvicorn main:app --reload      # API at http://127.0.0.1:8000/docs
@@ -55,13 +85,18 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 | Variable | Values | Notes |
 | --- | --- | --- |
 | `APP_ENV` | `dev` (default), `production` | Production refuses every development stand-in at startup: identity provider, checkpointer, agents, warehouse, retriever and catalog |
-| `IDENTITY_PROVIDER` | `simulated` (default), `entra` | `entra` needs `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `SNOWFLAKE_SCOPE_PREFIX`; optional `ENTRA_API_AUDIENCE`, `ENTRA_ALLOWED_CLIENT_IDS`, `SERVICE_PRINCIPALS_JSON`. Tokens must be v2.0 with the `upn` optional claim |
+| `IDENTITY_PROVIDER` | `simulated` (default), `entra`, `agentcore` | `entra` needs `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `SNOWFLAKE_SCOPE_PREFIX`; optional `ENTRA_API_AUDIENCE`, `ENTRA_ALLOWED_CLIENT_IDS`, `SERVICE_PRINCIPALS_JSON`. Tokens must be v2.0 with the `upn` optional claim |
 | `CHECKPOINT_BACKEND` | `sqlite` (default), `postgres`, `memory` | `CHECKPOINT_SQLITE_PATH` (default `.data/checkpoints.sqlite`) or `CHECKPOINT_DSN` |
-| `AGENT_BACKEND` | `simulated` (default), `llm` | `llm` needs `pip install anthropic`, `ANTHROPIC_API_KEY`, `AGENT_MODEL` |
+| `AGENT_BACKEND` | `simulated` (default), `llm` | `llm` needs `AGENT_MODEL` (a Bedrock model id or inference profile) |
+| `MODEL_PROVIDER` | `bedrock` (default), `anthropic` | Production requires `bedrock`. Optional per-role models: `MODEL_ROUTER`, `MODEL_SQL`, `MODEL_SYNTH`, `MODEL_VERIFIER` |
+| `MAX_TOKENS_PER_REQUEST` | integer (default 60000) | Token ceiling per request; a request over budget makes no further model calls |
+| `MODEL_PRICES_JSON` | JSON | Prices per million tokens by model id, for cost reporting. Unpriced models are metered in tokens only |
 | `WAREHOUSE_BACKEND` | `simulated` (default), `snowflake` | `snowflake` needs `pip install snowflake-connector-python`, `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_WAREHOUSE`; optional `SNOWFLAKE_DATABASE` |
-| `RETRIEVER_BACKEND` | `keyword` (default), `vector`, `snowflake` | `vector`: `CORPUS_PATH` (JSONL). `snowflake`: `PASSAGES_TABLE`, `SNOWFLAKE_CONNECTION_NAME` |
+| `RETRIEVER_BACKEND` | `keyword` (default), `vector`, `hybrid`, `snowflake` | `vector`, `hybrid`: `CORPUS_PATH` (JSONL). `snowflake`: `PASSAGES_TABLE`, `SNOWFLAKE_CONNECTION_NAME` |
 | `CATALOG_PATH` | file path | Catalog JSON from `python snowflake_backend.py export-catalog --overlay governance.json --out catalog.json` |
 | `SYNTHESIS_MODE` | `extractive` (default), `abstractive` | Extractive releases only verbatim source text. Abstractive releases model-written claims after a literal check and a verifier-model check; failures go to human review |
+| `AGENTCORE_OBO_PROVIDER`, `AGENTCORE_M2M_PROVIDER`, `AGENTCORE_MEMORY_ID` | names and id | AgentCore credential providers and memory, for `IDENTITY_PROVIDER=agentcore` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | Where to export traces; nothing is exported when unset |
 | `JUDGE_MODEL` | model id | For `python eval_harness.py --judge llm`; add `--agents llm` to evaluate the model-backed agents |
 
 ## Security properties
@@ -73,10 +108,30 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 - **Tokens**: access tokens live only in an in-process vault, bound to the principal they were issued to. State, checkpoints, logs and responses carry a fingerprint.
 - **Checkpoints**: a run's state is deleted when it finishes or crashes; only runs waiting on a reviewer persist. The SQLite file is owner-only, with secure delete on and the write-ahead log truncated after each delete. Encrypt the store at rest.
 - **Errors**: warehouse and connector messages are logged server-side and not returned to callers.
+- **Query results**: rows are released as evidence, so a SELECT list is an allow-list of shapes: a column, `*`, COUNT/SUM/AVG/MIN/MAX of a column, ROUND of those, and DATE_TRUNC of a column. Output names are derived from the shape (`avg_value`, `n`); an author cannot choose one. Every computed output must be named, because a warehouse names an unnamed expression after its text, table alias included. Extra arguments on those functions, GROUPING SETS, ROLLUP and CUBE, non-ASCII names, set operations, column lists on CTEs and subqueries, `* RENAME`, QUALIFY, DISTINCT ON, parenthesised joins, non-standard string forms and LIMIT anywhere but the outermost query are refused. The policy is applied twice: to the query as written and to the re-serialised SQL that will actually execute, because the SQL generator can rewrite a construct into a different one. The aim is that a query cannot hand back text or a number its author wrote. As a second check on what actually comes back, a result is not released if it has a column that is neither a catalog column of a table the query reads nor one of the query's own derived names. What a count or aggregate means still depends on the query's filters, which is why the executed SQL is returned with the answer.
+- **Scheduled jobs**: a job is whoever its verified app-only token says it is, and must be registered for the DAG it names. Nothing in a request body confers an identity.
+- **Relevance**: on the Strands runtime the agent picks its own search strings, so a document is released only if it also clears the thin-set gate for the question the caller actually asked.
+- **Memory**: a write policy screens out text that looks like a secret, an instruction to the agent, or query results (pattern-based, see limitations). Entries are capped per person. The agent cannot write memory once any document or data is in its context. People write only to their own memory; shared memory is a proposal until a different admin approves it. Recalled memory is placed in prompts as escaped data.
+- **Cost**: every request has a token ceiling; usage is metered by role and model.
 - **Environment**: any `APP_ENV` other than `dev`, `development`, `local` or `test` gets production rules.
 
 ## Known limitations
 
+- The Strands runtime reports HITL_REVIEW but has no pause-and-resume store; durable review exists only in the FastAPI runtime.
+- Shared (persona and organisation) memory is held in process; only user memory persists to AgentCore Memory.
+- The memory write policy is pattern-based. It blocks obvious secrets and instructions, including zero-width characters and words that mix two alphabets, but a reworded instruction or a planted "fact" gets through. What limits the damage is that memory only ever reaches its author's own prompt, as escaped data, and cannot change a gate.
+- The projection rule is strict: arithmetic, CASE, window functions, casts, unit conversions and constants in a SELECT list are refused, so some legitimate analytical queries cannot be expressed yet.
+- The platform's own traces withhold query text, SQL and identities. The Strands SDK's built-in tracing does not: if OpenTelemetry auto-instrumentation is switched on for the container, its spans carry prompts, SQL and user names. Leave it off, or redact at the collector.
+- A review resume gets its own token ceiling, so a run that pauses for review can spend up to twice the per-request limit.
+- Joins between two tables that share a foreign key (including a table joined to itself) pass the key check, so SUM or COUNT over one can be inflated by row fan-out. The values still come from table data.
+- Derived output names (`n`, `day`, `max_value`) assume the catalog has no real column with the same name. The demo catalog has none; a catalog loaded from Snowflake is not checked for this yet.
+- Selected column names are not resolved against the catalog; an unknown name fails in the warehouse rather than at the gate.
+- Relevance is checked for documents only. Whether returned rows answer the question is not checked on either runtime.
+- The MCP server accepts any valid token for the platform API; it has no audience of its own yet, so a token for one is good for the other.
+- Scheduled jobs on AgentCore need the optional `idtyp` claim enabled on the Entra app registration; without it they are refused.
+- The token ceiling on the Strands runtime relies on the model reporting usage. A model that reports none is bounded only by the turn limit.
+- The container image is not pinned by digest and has no dependency lock file.
+- No prompt caching and no automatic fallback between models.
 - Review decisions are serialised per run inside one API process. Run a single replica, or add a database lock, before scaling out.
 - An approved answer is returned to the reviewer's call; the original requester has no endpoint to fetch it.
 - The token vault is per process, so a run resumed on another replica cannot reach the warehouse and is refused.
@@ -88,6 +143,11 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 | --- | --- |
 | Gates, graph, API, eval harness | Tested in CI |
 | SQLite and Postgres checkpointers | Tested in CI, including resume after a simulated restart |
+| Strands agent and AgentCore entrypoint | Driven in CI by a scripted model through the real Strands loop and the real AgentCore app, for both the user and the scheduled-job path (with the simulated identity provider). Not yet deployed to AgentCore or run against a Bedrock model |
+| Bedrock adapter | Request shape, metering and budgets tested against a stubbed boto3 client. Not yet called against Bedrock |
+| AgentCore Identity and Memory adapters | Call shapes tested against fakes built from the SDK's signatures. Not yet run against the services |
+| MCP server | Tools exercised through the MCP SDK in-process, including authentication. Not yet placed behind AgentCore Gateway |
+| Terraform | Written from the AWS provider documentation. Never validated, planned or applied. IAM action names and resource ARNs for AgentCore Identity are unverified |
 | Entra provider | RS256 validation tested with a generated key pair; the JWKS download and MSAL calls are faked. Not yet run against a real tenant |
 | Model-backed agents and LLM judge | Logic tested with scripted completions. Not yet run against a live model |
 | Snowflake executor and catalog loader | Logic tested against a fake connection (token handling, row mapping, key discovery, fail-closed paths). Not yet run against a real account |
