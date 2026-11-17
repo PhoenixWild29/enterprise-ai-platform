@@ -94,7 +94,6 @@ def test_cte_names_are_resolved_in_scope_only():
         f"WITH a AS (SELECT equipment_id FROM {E}), b AS (SELECT equipment_id FROM a) SELECT * FROM b",
         f"WITH a AS (SELECT equipment_id FROM {E}) SELECT * FROM (SELECT equipment_id FROM a) s",
         f"WITH a AS (SELECT equipment_id FROM {E}), b AS (WITH c AS (SELECT equipment_id FROM a) SELECT equipment_id FROM c) SELECT * FROM b",
-        f"WITH a AS (SELECT equipment_id FROM {E}) SELECT equipment_id FROM a UNION ALL SELECT equipment_id FROM a",
         f"SELECT e.site_id FROM {E} e WHERE e.equipment_id IN (WITH x AS (SELECT equipment_id FROM {T} WHERE {B}) SELECT equipment_id FROM x)",
     ]
     out_of_scope = [

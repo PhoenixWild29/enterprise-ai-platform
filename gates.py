@@ -300,9 +300,16 @@ _PROJECTION_RULE = (
 )
 
 
+def _only_args(node: exp.Expression, *allowed: str) -> bool:
+    """True when the node carries nothing beyond the named arguments. An
+    argument this policy does not inspect is an argument it has not approved:
+    MIN(col, 'text') parses as an aggregate but executes as LEAST(col, 'text')."""
+    return all(key in allowed for key, value in node.args.items() if value not in (None, False, [], ""))
+
+
 def _plain_column(node: exp.Expression | None) -> str | None:
     """The lower-case name of a plain column reference, else None."""
-    if isinstance(node, exp.Column) and isinstance(node.this, exp.Identifier):
+    if isinstance(node, exp.Column) and isinstance(node.this, exp.Identifier) and _only_args(node, "this", "table"):
         return node.name.lower()
     return None
 
@@ -317,6 +324,8 @@ def _projection_names(value: exp.Expression) -> frozenset[str] | None:
     if (column := _plain_column(value)) is not None:
         return frozenset({column})
     if isinstance(value, exp.Round):
+        if not _only_args(value, "this", "decimals", "casts_non_integer_decimals"):
+            return None
         decimals = value.args.get("decimals")
         if decimals is not None and not (
             isinstance(decimals, exp.Literal) and decimals.is_int and 0 <= int(decimals.this) <= MAX_ROUND_DECIMALS
@@ -328,15 +337,21 @@ def _projection_names(value: exp.Expression) -> frozenset[str] | None:
         return _projection_names(inner)
     if type(value) in _AGGREGATES:
         prefixes, target = _AGGREGATES[type(value)], value.this
+        if not _only_args(value, "this", "big_int"):
+            return None  # extra arguments turn MIN/MAX into LEAST/GREATEST
         if isinstance(value, exp.Count) and isinstance(target, exp.Star):
-            return _COUNT_STAR_NAMES
-        if isinstance(value, exp.Count) and isinstance(target, exp.Distinct) and len(target.expressions) == 1:
+            return _COUNT_STAR_NAMES if _only_args(target) else None
+        if isinstance(value, exp.Count) and isinstance(target, exp.Distinct):
+            if len(target.expressions) != 1 or not _only_args(target, "expressions"):
+                return None
             target = target.expressions[0]
         column = _plain_column(target)
         if column is None:
             return None
         return frozenset({f"{p}_{column}" for p in prefixes} | {f"{column}_{p}" for p in prefixes})
     if isinstance(value, _TRUNC_TYPES):
+        if not _only_args(value, "this", "unit", "input_type_preserved"):
+            return None
         column, unit = _plain_column(value.this), value.args.get("unit")
         part = unit.name.lower() if isinstance(unit, (exp.Var, exp.Literal)) else ""
         if column is None or part not in _DATE_PARTS:
@@ -354,10 +369,26 @@ def _check_projection_policy(root: exp.Expression) -> None:
     for alias in root.find_all(exp.TableAlias):
         if alias.args.get("columns"):
             raise SQLValidationError("Column lists on a CTE or subquery are not allowed; they rename outputs.")
-    for select in root.find_all(exp.Select):
-        if select is not root and select.args.get("limit") is not None:
+    for node in root.find_all(exp.SetOperation):
+        # A set operation relabels values by position (a MIN released under the first branch's
+        # MAX name) and lets the number of branches decide what an outer COUNT returns.
+        raise SQLValidationError("UNION, INTERSECT and EXCEPT are not allowed in governed queries.")
+    for node in root.walk():
+        if node is not root and any(node.args.get(key) is not None for key in ("limit", "offset", "fetch")):
             # A row cap inside a subquery lets its author pick what an outer COUNT returns.
             raise SQLValidationError("LIMIT is only allowed on the outermost query.")
+        if node.args.get("qualify") is not None:
+            raise SQLValidationError("QUALIFY is not allowed in governed queries.")
+        if isinstance(node, exp.Distinct) and node.args.get("on") is not None:
+            raise SQLValidationError("DISTINCT ON is not allowed in governed queries.")
+        if isinstance(node, exp.Join) and not isinstance(node.parent, exp.Select):
+            # A join inside parentheses hangs off the table, where the key check would not see it.
+            raise SQLValidationError("Parenthesised joins are not allowed; write joins directly in the FROM clause.")
+    if root.args.get("offset") is not None or root.args.get("fetch") is not None:
+        raise SQLValidationError("OFFSET and FETCH are not allowed; use LIMIT.")
+    for select in root.find_all(exp.Select):
+        if not _only_args(select, "expressions", "from_", "from", "joins", "where", "group", "having", "order", "limit", "with_", "with", "distinct"):
+            raise SQLValidationError("That SELECT clause is not allowed in governed queries.")
         for projection in select.expressions:
             names = _projection_names(projection.unalias())
             if names is None:
@@ -406,6 +437,15 @@ def parse_read_only_sql(sql: str) -> exp.Expression:
         )
     try:
         _check_expression_policy(root)
+        # What executes is the SQL re-serialised from this tree, and the generator can rewrite
+        # constructs (MIN with two arguments becomes LEAST). So the policy is applied a second
+        # time to exactly what would be sent to the warehouse.
+        emitted = sqlglot.parse(root.sql(dialect=SQL_DIALECT), read=SQL_DIALECT)
+        if len(emitted) != 1 or type(emitted[0]) is not type(root):
+            raise SQLValidationError("The query changes shape when it is normalised.")
+        _check_expression_policy(emitted[0])
+    except SqlglotError as err:
+        raise SQLValidationError("The query could not be normalised.") from err
     except RecursionError as err:
         raise SQLValidationError("SQL is nested too deeply to validate.") from err
     return root
