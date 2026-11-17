@@ -2,10 +2,11 @@
 
   CATALOG_PATH        JSON catalog exported by snowflake_backend.py (default: demo catalog)
   AGENT_BACKEND       simulated (default) | llm            needs AGENT_MODEL
+  MODEL_PROVIDER      bedrock (default) | anthropic        see bedrock_models.py for per-role models and budgets
   SYNTHESIS_MODE      extractive (default) | abstractive   see llm_agents.LLMSynthesizer
   WAREHOUSE_BACKEND   simulated (default) | snowflake      needs SNOWFLAKE_ACCOUNT, SNOWFLAKE_WAREHOUSE
-  RETRIEVER_BACKEND   keyword (default) | vector | snowflake
-                      vector: CORPUS_PATH (JSONL); snowflake: PASSAGES_TABLE, SNOWFLAKE_CONNECTION_NAME
+  RETRIEVER_BACKEND   keyword (default) | vector | hybrid | snowflake
+                      vector, hybrid: CORPUS_PATH (JSONL); snowflake: PASSAGES_TABLE, SNOWFLAKE_CONNECTION_NAME
 
 Settings are validated at startup; optional client libraries (anthropic,
 snowflake-connector-python) are imported on first use.
@@ -27,6 +28,7 @@ class RuntimeConfig:
     catalog_source: str
     synthesis_mode: str = "extractive"
     corpus_path: str | None = None
+    model_provider: str = "bedrock"
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -37,6 +39,7 @@ class RuntimeConfig:
             catalog_source=os.environ.get("CATALOG_PATH") or "demo",
             synthesis_mode=os.environ.get("SYNTHESIS_MODE", "extractive").lower(),
             corpus_path=os.environ.get("CORPUS_PATH") or None,
+            model_provider=os.environ.get("MODEL_PROVIDER", "bedrock").lower(),
         )
 
     def production_problems(self) -> list[str]:
@@ -48,8 +51,10 @@ class RuntimeConfig:
             problems.append("WAREHOUSE_BACKEND=snowflake (the simulated executor returns synthetic rows)")
         if self.retriever_backend == "keyword":
             problems.append("RETRIEVER_BACKEND=vector or snowflake (the keyword retriever uses sample passages)")
-        if self.retriever_backend == "vector" and not self.corpus_path:
+        if self.retriever_backend in ("vector", "hybrid") and not self.corpus_path:
             problems.append("CORPUS_PATH (without it the vector retriever indexes the sample passages)")
+        if self.agent_backend == "llm" and self.model_provider != "bedrock":
+            problems.append("MODEL_PROVIDER=bedrock (models must run inside your own AWS account)")
         if self.synthesis_mode != "extractive":
             problems.append("SYNTHESIS_MODE=extractive (abstractive mode releases model-written text)")
         if self.catalog_source == "demo":
@@ -72,6 +77,18 @@ def _lazy_anthropic_completion():
         return client(prompt)
 
     return complete
+
+
+def model_completions(config: "RuntimeConfig") -> dict[str, object]:
+    """Completion functions by role for the configured model provider."""
+    if config.model_provider == "bedrock":
+        from bedrock_models import ModelPortfolio, portfolio_completions
+
+        return portfolio_completions(ModelPortfolio.from_env())
+    if config.model_provider == "anthropic":
+        single = _lazy_anthropic_completion()
+        return {role: single for role in ("router", "sql", "synth", "verifier", "judge")}
+    raise RuntimeError(f"Unknown MODEL_PROVIDER '{config.model_provider}' (use bedrock or anthropic).")
 
 
 def load_catalog(config: RuntimeConfig) -> Catalog:
@@ -108,7 +125,11 @@ def build_agent_deps(config: RuntimeConfig | None = None) -> AgentDeps:
             mode = config.synthesis_mode
             if mode not in ("extractive", "abstractive"):
                 raise RuntimeError(f"Unknown SYNTHESIS_MODE '{mode}' (use extractive or abstractive).")
-            deps = build_llm_deps(_lazy_anthropic_completion(), catalog, synthesis_mode=mode)
+            models = model_completions(config)
+            deps = build_llm_deps(
+                models["synth"], catalog, synthesis_mode=mode, router_complete=models["router"],
+                sql_complete=models["sql"], verifier_complete=models["verifier"],
+            )
         case other:
             raise RuntimeError(f"Unknown AGENT_BACKEND '{other}' (use simulated or llm).")
 
@@ -131,6 +152,14 @@ def build_agent_deps(config: RuntimeConfig | None = None) -> AgentDeps:
             index = VectorIndex(HashingEmbedder())
             index.add(load_corpus(config.corpus_path) if config.corpus_path else list(KNOWLEDGE_BASE))
             deps = replace(deps, retriever=VectorRetriever(index))
+        case "hybrid":
+            from retrieval import BM25Index, HashingEmbedder, HybridRetriever, VectorIndex, load_corpus
+
+            corpus = load_corpus(config.corpus_path) if config.corpus_path else list(KNOWLEDGE_BASE)
+            dense, sparse = VectorIndex(HashingEmbedder()), BM25Index()
+            dense.add(corpus)
+            sparse.add(corpus)
+            deps = replace(deps, retriever=HybridRetriever(dense, sparse))
         case "snowflake":
             from retrieval import SnowflakeVectorRetriever
             from snowflake_backend import service_connection
@@ -140,5 +169,5 @@ def build_agent_deps(config: RuntimeConfig | None = None) -> AgentDeps:
                 raise RuntimeError("RETRIEVER_BACKEND=snowflake requires PASSAGES_TABLE and SNOWFLAKE_CONNECTION_NAME.")
             deps = replace(deps, retriever=SnowflakeVectorRetriever(service_connection, table))
         case other:
-            raise RuntimeError(f"Unknown RETRIEVER_BACKEND '{other}' (use keyword, vector or snowflake).")
+            raise RuntimeError(f"Unknown RETRIEVER_BACKEND '{other}' (use keyword, vector, hybrid or snowflake).")
     return deps

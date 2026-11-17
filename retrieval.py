@@ -4,6 +4,7 @@ Retrievers (RETRIEVER_BACKEND):
   keyword    graph.keyword_retriever: term overlap over the sample corpus (dev default)
   vector     VectorRetriever: cosine search over an in-process index of a JSONL
              corpus (CORPUS_PATH), using any Embedder
+  hybrid     HybridRetriever: dense plus BM25 keyword search, fused by reciprocal rank
   snowflake  SnowflakeVectorRetriever: VECTOR_COSINE_SIMILARITY over a passages
              table, with the query embedded by SNOWFLAKE.CORTEX.EMBED_TEXT_768
 
@@ -151,6 +152,81 @@ class VectorRetriever:
 
     def __call__(self, query: str) -> list[Passage]:
         return self._index.search(query, self._top_k, self._min_score)
+
+
+class BM25Index:
+    """Sparse keyword index. Exact identifiers (fault codes, part numbers,
+    sensor ids) match here even when an embedding model blurs them."""
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
+        self._k1, self._b = k1, b
+        self._passages: list[Passage] = []
+        self._terms: list[dict[str, int]] = []
+        self._doc_freq: dict[str, int] = {}
+        self._total_len = 0
+
+    @staticmethod
+    def _tokens(text: str) -> list[str]:
+        return [w for w in re.findall(r"[a-z0-9][a-z0-9\-]*", text.lower()) if w not in _STOPWORDS]
+
+    def add(self, passages: list[Passage]) -> None:
+        for passage in passages:
+            counts: dict[str, int] = {}
+            for token in self._tokens(passage.text):
+                counts[token] = counts.get(token, 0) + 1
+            for token in counts:
+                self._doc_freq[token] = self._doc_freq.get(token, 0) + 1
+            self._passages.append(passage)
+            self._terms.append(counts)
+            self._total_len += sum(counts.values())
+
+    def search(self, query: str, top_k: int = 4) -> list[tuple[float, Passage]]:
+        """(share of query terms matched, passage), best BM25 score first."""
+        terms = list(dict.fromkeys(self._tokens(query)))
+        if not terms or not self._passages:
+            return []
+        n, avg_len = len(self._passages), self._total_len / len(self._passages)
+        scored: list[tuple[float, float, Passage]] = []
+        for counts, passage in zip(self._terms, self._passages):
+            length = sum(counts.values()) or 1
+            score = 0.0
+            for term in terms:
+                tf = counts.get(term, 0)
+                if tf:
+                    idf = math.log(1 + (n - self._doc_freq[term] + 0.5) / (self._doc_freq[term] + 0.5))
+                    score += idf * tf * (self._k1 + 1) / (tf + self._k1 * (1 - self._b + self._b * length / avg_len))
+            if score > 0:
+                coverage = sum(1 for t in terms if counts.get(t)) / len(terms)
+                scored.append((score, coverage, passage))
+        scored.sort(key=lambda item: -item[0])
+        return [(round(coverage, 4), passage) for _, coverage, passage in scored[:top_k]]
+
+
+class HybridRetriever:
+    """`graph.Retriever` that fuses dense and sparse results by reciprocal
+    rank. A passage's confidence is the stronger of its cosine similarity and
+    the share of query terms it matched, so an exact identifier match is not
+    penalised for a weak embedding."""
+
+    def __init__(self, dense: VectorIndex, sparse: BM25Index, top_k: int = 4, min_score: float = 0.2, rrf_k: int = 60) -> None:
+        self._dense, self._sparse, self._top_k, self._min_score, self._rrf_k = dense, sparse, top_k, min_score, rrf_k
+
+    def __call__(self, query: str) -> list[Passage]:
+        pool = self._top_k * 3
+        fused: dict[str, float] = {}
+        best: dict[str, Passage] = {}
+        ranked_lists = [
+            [(p.score, p) for p in self._dense.search(query, pool, 0.0)],
+            self._sparse.search(query, pool),
+        ]
+        for ranked in ranked_lists:
+            for rank, (confidence, passage) in enumerate(ranked):
+                fused[passage.passage_id] = fused.get(passage.passage_id, 0.0) + 1.0 / (self._rrf_k + rank + 1)
+                current = best.get(passage.passage_id)
+                if current is None or confidence > current.score:
+                    best[passage.passage_id] = passage.model_copy(update={"score": _clamp(confidence)})
+        ordered = sorted(best.values(), key=lambda p: -fused[p.passage_id])
+        return [p for p in ordered if p.score > self._min_score][: self._top_k]
 
 
 class SnowflakeVectorRetriever:

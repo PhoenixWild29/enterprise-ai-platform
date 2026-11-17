@@ -422,12 +422,27 @@ def build_llm_deps(
     complete: Completion,
     catalog: Catalog = DEFAULT_CATALOG,
     synthesis_mode: Literal["extractive", "abstractive"] = "extractive",
+    *,
+    router_complete: Completion | None = None,
+    sql_complete: Completion | None = None,
+    verifier_complete: Completion | None = None,
 ) -> AgentDeps:
     """AgentDeps with model-backed router, SQL generator and synthesizer. The
-    retriever and warehouse executor keep their configured implementations."""
+    retriever and warehouse executor keep their configured implementations.
+
+    `complete` is the default model. The optional per-role functions let a
+    cheap model do routing while a stronger one writes SQL (model right-sizing)."""
+    verifier = llm_claim_verifier(verifier_complete or complete) if synthesis_mode == "abstractive" else None
     return AgentDeps(
         catalog=catalog,
-        router=LLMRouter(complete),
-        sql_generator=LLMSQLGenerator(complete, catalog),
-        synthesizer=LLMSynthesizer(complete, mode=synthesis_mode),
+        router=LLMRouter(router_complete or complete),
+        sql_generator=LLMSQLGenerator(sql_complete or complete, catalog),
+        synthesizer=LLMSynthesizer(complete, mode=synthesis_mode, verifier=verifier),
     )
+
+
+def build_extractive_answer(query: str, items: list[dict[str, Any]], passages: list[Passage]) -> tuple[str, list[Citation]]:
+    """Draft and citations from model-selected evidence items
+    ({"passage_id", "quote"}), using the extractive rules: whole passages
+    only, anything unverifiable cited as written so the citation gate refuses."""
+    return LLMSynthesizer(lambda prompt: json.dumps({"evidence": items}))(query, passages)

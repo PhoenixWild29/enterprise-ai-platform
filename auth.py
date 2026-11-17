@@ -400,7 +400,7 @@ def _snowflake_role_for(app_roles: list[str]) -> str:
 
 
 def get_identity_provider() -> IdentityProvider:
-    """Provider named by IDENTITY_PROVIDER: `simulated` (default) or `entra`."""
+    """Provider named by IDENTITY_PROVIDER: `simulated` (default), `entra` or `agentcore`."""
     choice = os.environ.get("IDENTITY_PROVIDER", "simulated").lower()
     if choice == "simulated":
         return IDP
@@ -408,7 +408,11 @@ def get_identity_provider() -> IdentityProvider:
         from entra import EntraIDProvider  # imported lazily: needs msal and PyJWT
 
         return EntraIDProvider.from_env()
-    raise RuntimeError(f"Unknown IDENTITY_PROVIDER '{choice}' (use simulated or entra).")
+    if choice == "agentcore":
+        from agentcore_identity import AgentCoreIdentityProvider  # needs bedrock-agentcore
+
+        return AgentCoreIdentityProvider.from_env()
+    raise RuntimeError(f"Unknown IDENTITY_PROVIDER '{choice}' (use simulated, entra or agentcore).")
 
 
 ACTIVE_IDP: IdentityProvider = get_identity_provider()
