@@ -236,6 +236,8 @@ GOLD_BENCHMARK: tuple[GoldCase, ...] = (
     _sql("sql-ref-40", "Rows manufactured by rollup",
          f"SELECT t.sensor_id, COUNT(*) AS n FROM {_T} t WHERE t.{_BOUND} GROUP BY ROLLUP(t.sensor_id) LIMIT 5",
          expect_reason_contains="GROUP BY may list only"),
+    _sql("sql-ref-41", "Coarsened timestamp released under the raw column name",
+         f"SELECT DATE_TRUNC('year', t.reading_ts) AS reading_ts FROM {_T} t WHERE t.{_BOUND} LIMIT 5", expect_reason_contains="Output name"),
     _sql("sql-ref-31", "Star with renamed columns",
          f"SELECT * RENAME (sensor_id AS wire_money) FROM {_T} t WHERE t.{_BOUND} LIMIT 1",
          expect_reason_contains="SELECT list may contain only"),

@@ -10,6 +10,7 @@ Fail-closed rule: anything a gate cannot positively verify is REFUSED.
 """
 
 import math
+import re
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -294,6 +295,7 @@ _UNUSUAL_STRINGS: tuple[type[exp.Expression], ...] = tuple(
     if isinstance(t := getattr(exp, n, None), type)
 )
 MAX_ROUND_DECIMALS = 6
+_PLAIN_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
 _PROJECTION_RULE = (
     "A SELECT list may contain only columns, *, COUNT/SUM/AVG/MIN/MAX of a column, ROUND of those, "
     "and DATE_TRUNC of a column."
@@ -356,7 +358,8 @@ def _projection_names(value: exp.Expression) -> frozenset[str] | None:
         part = unit.name.lower() if isinstance(unit, (exp.Var, exp.Literal)) else ""
         if column is None or part not in _DATE_PARTS:
             return None
-        return frozenset({part, column, f"{part}_{column}", f"{column}_{part}"})
+        # Never the bare column name: a timestamp cut to the year must not be labelled as the timestamp.
+        return frozenset({part, f"{part}_{column}", f"{column}_{part}"})
     return None
 
 
@@ -375,7 +378,9 @@ def _check_projection_policy(root: exp.Expression) -> None:
         raise SQLValidationError("UNION, INTERSECT and EXCEPT are not allowed in governed queries.")
     for node in root.walk():
         if node is not root and any(node.args.get(key) is not None for key in ("limit", "offset", "fetch")):
-            # A row cap inside a subquery lets its author pick what an outer COUNT returns.
+            # A row cap inside a subquery is the direct way to pick what an outer COUNT returns.
+            # (A determined author can still shape a count with WHERE filters; that is a
+            # documented limitation, not something this rule claims to prevent.)
             raise SQLValidationError("LIMIT is only allowed on the outermost query.")
         if node.args.get("qualify") is not None:
             raise SQLValidationError("QUALIFY is not allowed in governed queries.")
@@ -387,8 +392,9 @@ def _check_projection_policy(root: exp.Expression) -> None:
     if root.args.get("offset") is not None or root.args.get("fetch") is not None:
         raise SQLValidationError("OFFSET and FETCH are not allowed; use LIMIT.")
     for ident in root.find_all(exp.Identifier, exp.Var):
-        if not ident.name.isascii():
-            raise SQLValidationError("Names and keywords must be plain ASCII.")  # look-alike letters fold to real names
+        # Plain names only: look-alike letters fold to real names, and control characters hide in them.
+        if not _PLAIN_NAME.fullmatch(ident.name):
+            raise SQLValidationError("Names and keywords must be plain ASCII letters, digits and underscores.")
     for group in root.find_all(exp.Group):
         # GROUPING SETS, ROLLUP and CUBE add rows that do not depend on the data, so an outer
         # aggregate over them returns a number the author picked.
