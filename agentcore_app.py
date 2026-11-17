@@ -4,11 +4,15 @@ AgentCore Runtime hosts this app in a per-session microVM and calls
 POST /invocations. The handler authenticates the caller, runs the Strands
 agent with its gated tools, and returns the gated result.
 
-  user-facing      the caller's JWT arrives in the Authorization header
-                   (allow-list it in the runtime's request-header settings);
-                   everything runs on behalf of that person
-  scheduled jobs   the payload names the job; it runs under a service
-                   principal's scoped role and never waits on a human
+Every invocation carries a bearer token in the Authorization header
+(allow-list it in the runtime's request-header settings). The token decides
+who the caller is; nothing in the request body can.
+
+  user-facing      a person's token: everything runs on behalf of that person
+  scheduled jobs   the scheduler's own app-only token, plus the DAG and run
+                   in the payload. The service principal is read from the
+                   verified token and must be registered for that DAG; the
+                   run uses its scoped role and never waits on a human
 
 Run locally:   python agentcore_app.py        (serves on port 8080)
 Deploy:        see infra/terraform and the Dockerfile
@@ -21,11 +25,12 @@ from typing import Any
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from auth import ACTIVE_IDP, IDP, AuthContext, AuthError, authenticate_service, authenticate_user
+from auth import ACTIVE_IDP, IDP, AuthContext, AuthError, authenticate_service_token, authenticate_user
 from memory import AgentCoreMemoryStore, MemoryService
 from runtime import RuntimeConfig, build_agent_deps, catalog_problems
 from schemas import GateStatus
 from strands_agent import bedrock_model_from_env, run_strands_query
+from telemetry import default_provider, export_run
 
 logger = logging.getLogger("platform.agentcore")
 
@@ -35,20 +40,21 @@ IS_PRODUCTION = APP_ENV not in {"dev", "development", "local", "test"}
 app = BedrockAgentCoreApp()
 
 
-class JobIdentity(BaseModel):
+class JobRun(BaseModel):
+    """Which scheduled run this is. It carries no identity: who the job is
+    comes from its bearer token."""
+
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    client_id: str = Field(min_length=1)
-    client_secret: str = Field(default="", repr=False)
-    airflow_dag_id: str = Field(min_length=1)
-    airflow_dag_run_id: str = Field(min_length=1)
+    airflow_dag_id: str = Field(min_length=1, max_length=200)
+    airflow_dag_run_id: str = Field(min_length=1, max_length=200)
 
 
 class Invocation(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     prompt: str = Field(min_length=1, max_length=4_000)
-    job: JobIdentity | None = None
+    job: JobRun | None = None
 
 
 class Platform:
@@ -71,7 +77,8 @@ _PLATFORM: Platform | None = None
 
 
 def platform() -> Platform:
-    """Built once, on the first request, from the environment."""
+    """Built once from the environment: at startup when run as a service, so a
+    misconfigured container never becomes healthy, otherwise on first use."""
     global _PLATFORM
     if _PLATFORM is None:
         config = RuntimeConfig.from_env()
@@ -111,6 +118,12 @@ def _refused(reason: str) -> dict[str, Any]:
             "citations": [], "refusal_reason": reason}
 
 
+# What a caller is told. The specific reason (which claim, which audience, which
+# setting) goes to the server log only.
+AUTH_REFUSAL = "[auth_gate] Authentication failed."
+CONFIG_REFUSAL = "[configuration] The service is not available."
+
+
 @app.entrypoint
 def invoke(payload: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
@@ -118,25 +131,35 @@ def invoke(payload: dict[str, Any], context: Any) -> dict[str, Any]:
     except ValidationError as err:
         return _refused("[request] " + "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in err.errors()))
 
-    services = platform()
+    try:
+        services = platform()
+    except Exception:  # noqa: BLE001 - configuration detail is for operators, not callers
+        logger.exception("platform.unavailable")
+        return _refused(CONFIG_REFUSAL)
     session_id = getattr(context, "session_id", None)
     try:
+        token = _bearer(getattr(context, "request_headers", None))
         if request.job is not None:
-            job = request.job
-            ctx: AuthContext = authenticate_service(
-                job.client_id, job.client_secret, job.airflow_dag_id, job.airflow_dag_run_id, idp=services.idp
+            ctx: AuthContext = authenticate_service_token(
+                token, request.job.airflow_dag_id, request.job.airflow_dag_run_id, idp=services.idp
             )
         else:
-            ctx = authenticate_user(_bearer(getattr(context, "request_headers", None)), idp=services.idp)
-    except AuthError as err:
-        return _refused(f"[auth_gate] {err}")
+            ctx = authenticate_user(token, idp=services.idp)
+    except AuthError:  # the reason is already in the auth log
+        return _refused(AUTH_REFUSAL)
 
-    out = run_strands_query(
-        request.prompt, ctx, services.deps, services.model,
-        memory=services.memory if request.job is None else None, session_id=session_id,
-    )
+    memory = services.memory if request.job is None else None
+    if memory is not None and isinstance(memory.store, AgentCoreMemoryStore):
+        try:
+            memory.store.load_user(ctx.principal)  # each session starts in a fresh runtime: bring this person's memory in
+        except Exception:  # noqa: BLE001 - memory is a convenience; without it the request still runs
+            logger.exception("memory.load.failed")
+            memory = None
+
+    out = run_strands_query(request.prompt, ctx, services.deps, services.model, memory=memory, session_id=session_id)
     released = out["gate_status"] is GateStatus.PASSED
     logger.info("invocation.done principal=%s status=%s trace_id=%s", ctx.principal, out["gate_status"].value, out["trace_id"])
+    export_run(out, default_provider())
     return {
         "status": out["gate_status"].value,
         "answer": out["final_response"],
@@ -150,4 +173,5 @@ def invoke(payload: dict[str, Any], context: Any) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
+    platform()  # fail at startup, loudly and in the operator's log, rather than on the first request
     app.run()

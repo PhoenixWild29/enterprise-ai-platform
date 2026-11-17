@@ -8,6 +8,12 @@
 
 data "aws_caller_identity" "current" {}
 
+locals {
+  account_id = data.aws_caller_identity.current.account_id
+  # AgentCore Runtime creates its own log groups, named from the generated runtime id.
+  runtime_log_groups = "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/bedrock-agentcore/runtimes/*"
+}
+
 resource "aws_ecr_repository" "agent" {
   name                 = replace(var.name, "_", "-")
   image_tag_mutability = "IMMUTABLE"
@@ -15,11 +21,11 @@ resource "aws_ecr_repository" "agent" {
   image_scanning_configuration {
     scan_on_push = true
   }
-}
 
-resource "aws_cloudwatch_log_group" "agent" {
-  name              = "/aws/bedrock-agentcore/runtimes/${var.name}"
-  retention_in_days = var.log_retention_days
+  encryption_configuration {
+    encryption_type = var.kms_key_arn == null ? "AES256" : "KMS"
+    kms_key         = var.kms_key_arn
+  }
 }
 
 data "aws_iam_policy_document" "assume" {
@@ -35,7 +41,13 @@ data "aws_iam_policy_document" "assume" {
     condition {
       test     = "StringEquals"
       variable = "aws:SourceAccount"
-      values   = [data.aws_caller_identity.current.account_id]
+      values   = [local.account_id]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:bedrock-agentcore:${var.region}:${local.account_id}:*"]
     }
   }
 }
@@ -55,8 +67,8 @@ data "aws_iam_policy_document" "execution" {
 
   statement {
     sid       = "Logs"
-    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["${aws_cloudwatch_log_group.agent.arn}:*"]
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"]
+    resources = [local.runtime_log_groups, "${local.runtime_log_groups}:*"]
   }
 
   statement {
@@ -73,6 +85,8 @@ data "aws_iam_policy_document" "execution" {
   }
 
   # AgentCore Identity: exchange the caller's workload token for a Snowflake token.
+  # Scoped to this agent's workload identity, its token vault and the two
+  # credential providers it uses; no wildcard.
   statement {
     sid = "WorkloadIdentityTokens"
     actions = [
@@ -80,9 +94,17 @@ data "aws_iam_policy_document" "execution" {
       "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
       "bedrock-agentcore:GetResourceOauth2Token",
     ]
-    resources = ["*"]
+    resources = var.identity_resource_arns
   }
 
+  # The credential providers keep their client secrets in Secrets Manager.
+  statement {
+    sid       = "CredentialProviderSecrets"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = var.credential_secret_arns
+  }
+
+  # Memory is append-only from the agent: forgetting an entry writes a tombstone event.
   statement {
     sid       = "AgentMemory"
     actions   = ["bedrock-agentcore:CreateEvent", "bedrock-agentcore:ListEvents", "bedrock-agentcore:GetEvent"]
@@ -118,6 +140,7 @@ resource "aws_bedrockagentcore_agent_runtime" "agent" {
   }
 
   # Private networking: the runtime reaches Bedrock, Snowflake and ECR through the VPC.
+  # It also needs HTTPS egress to login.microsoftonline.com to fetch Entra signing keys.
   network_configuration {
     network_mode = "VPC"
 
@@ -127,8 +150,11 @@ resource "aws_bedrockagentcore_agent_runtime" "agent" {
     }
   }
 
-  # Inbound user tokens are checked by the runtime before the container sees them,
-  # and checked again in the application.
+  # Inbound tokens are checked by the runtime before the container sees them, and
+  # checked again in the application. People and scheduled jobs both call with an
+  # Entra token for the API audience: a job signs in with its own client credentials
+  # and its client id must be in allowed_client_ids. The application reads the job's
+  # identity from that token (needs the optional idtyp claim on the app registration).
   authorizer_configuration {
     custom_jwt_authorizer {
       discovery_url    = "https://login.microsoftonline.com/${var.entra_tenant_id}/v2.0/.well-known/openid-configuration"
@@ -142,17 +168,27 @@ resource "aws_bedrockagentcore_agent_runtime" "agent" {
     request_header_allowlist = ["Authorization"]
   }
 
+  # No secrets here: environment variables are stored in plain text and in state.
+  # The fixed settings come last so var.environment cannot override them.
   environment_variables = merge(
-    {
-      APP_ENV              = "production"
-      IDENTITY_PROVIDER    = "agentcore"
-      WAREHOUSE_BACKEND    = "snowflake"
-      AWS_REGION           = var.region
-      ENTRA_TENANT_ID      = var.entra_tenant_id
-      ENTRA_API_AUDIENCE   = var.api_audience
-      AGENTCORE_MEMORY_ID  = aws_bedrockagentcore_memory.agent.id
-    },
     var.environment,
+    {
+      APP_ENV                 = "production"
+      IDENTITY_PROVIDER       = "agentcore"
+      WAREHOUSE_BACKEND       = "snowflake"
+      RETRIEVER_BACKEND       = var.retriever_backend
+      CATALOG_PATH            = var.catalog_path
+      AWS_REGION              = var.region
+      AGENT_MODEL             = var.agent_model
+      ENTRA_TENANT_ID         = var.entra_tenant_id
+      ENTRA_CLIENT_ID         = var.entra_client_id
+      ENTRA_API_AUDIENCE      = var.api_audience
+      SNOWFLAKE_SCOPE_PREFIX  = var.snowflake_scope_prefix
+      AGENTCORE_OBO_PROVIDER  = var.obo_credential_provider_name
+      AGENTCORE_M2M_PROVIDER  = var.m2m_credential_provider_name
+      SERVICE_PRINCIPALS_JSON = var.service_principals_json
+      AGENTCORE_MEMORY_ID     = aws_bedrockagentcore_memory.agent.id
+    },
   )
 
   depends_on = [aws_iam_role_policy.agent]

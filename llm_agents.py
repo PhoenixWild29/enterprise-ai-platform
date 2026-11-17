@@ -383,7 +383,9 @@ class LLMSynthesizer:
             citations.append(Citation(passage_id=passage_id, snippet=snippet))
         if not lines:
             return "", []
-        return f"Findings for: {query}\n" + "\n".join(lines), citations
+        # The question is not echoed: a released answer holds evidence only, so a caller
+        # cannot plant text in it that reads like a cited finding.
+        return "Findings:\n" + "\n".join(lines), citations
 
 
 class LLMRouter:

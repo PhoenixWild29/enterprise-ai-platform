@@ -26,11 +26,11 @@ class ScriptedModel(Model):
         if isinstance(turn, Exception):
             raise turn
         yield {"messageStart": {"role": "assistant"}}
-        if "tool" in turn:
-            name, args = turn["tool"]
-            yield {"contentBlockStart": {"start": {"toolUse": {"name": name, "toolUseId": f"tu-{len(self.calls)}"}}}}
-            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(args)}}}}
-            yield {"contentBlockStop": {}}
+        if "tool" in turn or "tools" in turn:  # "tools": several tool uses in one model turn
+            for i, (name, args) in enumerate(turn.get("tools") or [turn["tool"]]):
+                yield {"contentBlockStart": {"start": {"toolUse": {"name": name, "toolUseId": f"tu-{len(self.calls)}-{i}"}}}}
+                yield {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(args)}}}}
+                yield {"contentBlockStop": {}}
             yield {"messageStop": {"stopReason": "tool_use"}}
         else:
             yield {"contentBlockStart": {"start": {}}}

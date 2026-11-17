@@ -20,9 +20,9 @@ The guarantees do not live in either orchestrator. They live in `gates.py` and i
 | --- | --- |
 | Runtime | `agentcore_app.py`, `Dockerfile`, `infra/terraform` |
 | Gateway (MCP tools) | `mcp_server.py`: `find_tables`, `search_manuals`, `run_sql`, each run as the caller |
-| Identity | `agentcore_identity.py`: on-behalf-of exchange for users, machine flow for scheduled jobs |
+| Identity | `agentcore_identity.py`: on-behalf-of exchange for users; scheduled jobs present their own app-only token and get a machine-flow token for their one role |
 | Memory | `memory.py`: session, user, persona and organisation scopes with a write policy and review; `AgentCoreMemoryStore` |
-| Observability | `telemetry.py`: one trace per run from the audit trail, exported over OTLP |
+| Observability | `telemetry.py`: both runtimes emit one trace per run from the audit trail, over OTLP when an endpoint is set. Spans carry decisions and counts, never query text, SQL, gate messages or a person's identity |
 | Models | `bedrock_models.py`: Bedrock Converse, per-role model portfolio, token budgets, cost metering |
 
 ## Flow (LangGraph runtime)
@@ -67,7 +67,7 @@ output node. A citation failure on the user path pauses for human review.
 ## Run
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pytest -q                      # unit, graph, API, provider and persistence tests
 python eval_harness.py         # both evaluation tiers
 uvicorn main:app --reload      # API at http://127.0.0.1:8000/docs
@@ -108,7 +108,10 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 - **Tokens**: access tokens live only in an in-process vault, bound to the principal they were issued to. State, checkpoints, logs and responses carry a fingerprint.
 - **Checkpoints**: a run's state is deleted when it finishes or crashes; only runs waiting on a reviewer persist. The SQLite file is owner-only, with secure delete on and the write-ahead log truncated after each delete. Encrypt the store at rest.
 - **Errors**: warehouse and connector messages are logged server-side and not returned to callers.
-- **Memory**: secrets, instructions to the agent and query results are never persisted. People write only to their own memory; shared memory is a proposal until a different admin approves it. Recalled memory is placed in prompts as escaped data.
+- **Query results**: a query cannot return a value its author made up. Constants in a SELECT list are refused, every selected expression must read a column, and output names are built from column names and a fixed set of aggregate words. Rows are released as evidence, so this is what stops SQL from being a way to write the answer.
+- **Scheduled jobs**: a job is whoever its verified app-only token says it is, and must be registered for the DAG it names. Nothing in a request body confers an identity.
+- **Relevance**: on the Strands runtime the agent picks its own search strings, so a document is released only if it also clears the thin-set gate for the question the caller actually asked.
+- **Memory**: a write policy screens out text that looks like a secret, an instruction to the agent, or query results (pattern-based, see limitations). Entries are capped per person. The agent cannot write memory once any document or data is in its context. People write only to their own memory; shared memory is a proposal until a different admin approves it. Recalled memory is placed in prompts as escaped data.
 - **Cost**: every request has a token ceiling; usage is metered by role and model.
 - **Environment**: any `APP_ENV` other than `dev`, `development`, `local` or `test` gets production rules.
 
@@ -116,7 +119,13 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 
 - The Strands runtime reports HITL_REVIEW but has no pause-and-resume store; durable review exists only in the FastAPI runtime.
 - Shared (persona and organisation) memory is held in process; only user memory persists to AgentCore Memory.
-- The memory write policy is pattern-based. It blocks obvious secrets and instructions, not every possible phrasing.
+- The memory write policy is pattern-based. It blocks obvious secrets and instructions, including zero-width and look-alike spellings, but not every possible phrasing. What limits the damage is that memory only ever reaches its author's own prompt, as escaped data, and cannot change a gate.
+- The projection rule is strict: computed labels, unit conversions and constants in a SELECT list are refused, so some legitimate queries have to be rephrased.
+- Relevance is checked for documents only. Whether returned rows answer the question is not checked on either runtime.
+- The MCP server accepts any valid token for the platform API; it has no audience of its own yet, so a token for one is good for the other.
+- Scheduled jobs on AgentCore need the optional `idtyp` claim enabled on the Entra app registration; without it they are refused.
+- The token ceiling on the Strands runtime relies on the model reporting usage. A model that reports none is bounded only by the turn limit.
+- The container image is not pinned by digest and has no dependency lock file.
 - No prompt caching and no automatic fallback between models.
 - Review decisions are serialised per run inside one API process. Run a single replica, or add a database lock, before scaling out.
 - An approved answer is returned to the reviewer's call; the original requester has no endpoint to fetch it.
@@ -129,11 +138,11 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 | --- | --- |
 | Gates, graph, API, eval harness | Tested in CI |
 | SQLite and Postgres checkpointers | Tested in CI, including resume after a simulated restart |
-| Strands agent and AgentCore entrypoint | Driven end to end in CI by a scripted model through the real Strands loop and the real AgentCore app. Not yet deployed to AgentCore or run against a Bedrock model |
+| Strands agent and AgentCore entrypoint | Driven in CI by a scripted model through the real Strands loop and the real AgentCore app, for both the user and the scheduled-job path (with the simulated identity provider). Not yet deployed to AgentCore or run against a Bedrock model |
 | Bedrock adapter | Request shape, metering and budgets tested against a stubbed boto3 client. Not yet called against Bedrock |
 | AgentCore Identity and Memory adapters | Call shapes tested against fakes built from the SDK's signatures. Not yet run against the services |
 | MCP server | Tools exercised through the MCP SDK in-process, including authentication. Not yet placed behind AgentCore Gateway |
-| Terraform | Written from the AWS provider documentation. Never validated, planned or applied |
+| Terraform | Written from the AWS provider documentation. Never validated, planned or applied. IAM action names and resource ARNs for AgentCore Identity are unverified |
 | Entra provider | RS256 validation tested with a generated key pair; the JWKS download and MSAL calls are faked. Not yet run against a real tenant |
 | Model-backed agents and LLM judge | Logic tested with scripted completions. Not yet run against a live model |
 | Snowflake executor and catalog loader | Logic tested against a fake connection (token handling, row mapping, key discovery, fail-closed paths). Not yet run against a real account |

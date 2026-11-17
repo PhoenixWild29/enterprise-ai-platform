@@ -181,7 +181,10 @@ class BM25Index:
             self._total_len += sum(counts.values())
 
     def search(self, query: str, top_k: int = 4) -> list[tuple[float, Passage]]:
-        """(share of query terms matched, passage), best BM25 score first."""
+        """(keyword confidence, passage), best BM25 score first. Confidence is
+        the share of query terms the passage matched, but a single matched term
+        counts only when it is rare (an identifier such as a fault code): one
+        common word matching is not evidence that a passage answers a question."""
         terms = list(dict.fromkeys(self._tokens(query)))
         if not terms or not self._passages:
             return []
@@ -196,8 +199,9 @@ class BM25Index:
                     idf = math.log(1 + (n - self._doc_freq[term] + 0.5) / (self._doc_freq[term] + 0.5))
                     score += idf * tf * (self._k1 + 1) / (tf + self._k1 * (1 - self._b + self._b * length / avg_len))
             if score > 0:
-                coverage = sum(1 for t in terms if counts.get(t)) / len(terms)
-                scored.append((score, coverage, passage))
+                matched = [t for t in terms if counts.get(t)]
+                specific = len(matched) >= 2 or self._doc_freq[matched[0]] == 1
+                scored.append((score, len(matched) / len(terms) if specific else 0.0, passage))
         scored.sort(key=lambda item: -item[0])
         return [(round(coverage, 4), passage) for _, coverage, passage in scored[:top_k]]
 

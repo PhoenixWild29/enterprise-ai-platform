@@ -9,8 +9,11 @@ traces land in Amazon CloudWatch next to AgentCore's own spans.
   OTEL_EXPORTER_OTLP_ENDPOINT   collector endpoint; when unset, nothing is exported
   OTEL_SERVICE_NAME             defaults to enterprise-ai-platform
 
-Span attributes carry identifiers and decisions, never query text, SQL
-results or passage text.
+Span attributes carry decisions, counts, table names, role names and job
+identifiers (service account, DAG, run). They never carry a person's
+identity, query text, SQL, gate messages, results or passage text: a gate
+message can quote what a caller or a model wrote, so only the name of the
+gate that refused is exported.
 """
 
 import os
@@ -49,13 +52,29 @@ def _attributes(event: AuditEvent) -> dict[str, Any]:
     if event.status is not None:
         attrs["platform.gate_status"] = event.status.value
     if event.status is GateStatus.REFUSED and event.event_type in ("gate", "security"):
-        attrs["platform.refusal_reason"] = event.message[:300]  # gate reasons name rules and tables, not data
+        attrs["platform.refused_by"] = event.node  # the gate's name only; its message can quote caller or model text
     for key, value in event.detail.items():
         if key in _SAFE_DETAIL_KEYS and isinstance(value, (str, int, float, bool)):
             attrs[f"platform.{key}"] = value
         elif key in _SAFE_DETAIL_KEYS and isinstance(value, list):
             attrs[f"platform.{key}"] = [str(v) for v in value]
     return attrs
+
+
+_DEFAULT_PROVIDER: TracerProvider | None = None
+_DEFAULT_BUILT = False
+
+
+def default_provider() -> TracerProvider | None:
+    """The process-wide provider, built once from the environment."""
+    global _DEFAULT_PROVIDER, _DEFAULT_BUILT
+    if not _DEFAULT_BUILT:
+        try:
+            _DEFAULT_PROVIDER = build_tracer_provider()
+        except Exception:  # noqa: BLE001 - telemetry cannot stop the service
+            _DEFAULT_PROVIDER = None
+        _DEFAULT_BUILT = True
+    return _DEFAULT_PROVIDER
 
 
 def export_run(outcome: dict[str, Any], provider: TracerProvider | None, usage: dict[str, Any] | None = None) -> str | None:

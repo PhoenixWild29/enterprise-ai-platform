@@ -6,8 +6,10 @@ AgentCore Identity for the downstream Snowflake token:
 
   user path      auth_flow ON_BEHALF_OF_TOKEN_EXCHANGE: the token carries the
                  person's identity, so Snowflake row-level security applies
-  headless path  auth_flow M2M: the job's own credential provider, mapped to
-                 one scoped execution role and its registered DAGs
+  headless path  the scheduler signs in to Entra itself and presents its own
+                 app-only token. The service principal is read from that
+                 verified token, then auth_flow M2M fetches the Snowflake
+                 token for its one scoped execution role
 
 The inbound token is still validated here (RS256, issuer, audience, tenant)
 by the same code the Entra provider uses: defence in depth, and the claims
@@ -91,7 +93,7 @@ class AgentCoreIdentityProvider:
     def from_env(cls) -> "AgentCoreIdentityProvider":
         from entra import EntraIDProvider
 
-        validator = EntraIDProvider.from_env()
+        validator = EntraIDProvider.from_env(validator_only=True)  # AgentCore Identity holds the secrets
         return cls(
             validator=validator,
             obo_provider=os.environ.get("AGENTCORE_OBO_PROVIDER", ""),
@@ -139,8 +141,14 @@ class AgentCoreIdentityProvider:
         return self._token(self._obo_provider, scope, "ON_BEHALF_OF_TOKEN_EXCHANGE", "On-behalf-of exchange")
 
     def acquire_service_token(self, client_id: str, client_secret: str) -> DownstreamToken:
-        # The job's secret lives in the AgentCore credential provider, not in the request,
-        # so `client_secret` is not used here; the caller is identified by its workload token.
+        # A client id in a request body proves nothing, and this provider holds no
+        # job secrets to check one against. Jobs present their own app-only token.
+        raise AuthError("Service principal authentication failed.")
+
+    def validate_service_token(self, token: str) -> dict[str, Any]:
+        return self._validator.validate_service_token(token)
+
+    def exchange_service_token(self, client_id: str) -> DownstreamToken:
         if client_id not in self._service_principals:
             raise AuthError("Service principal authentication failed.")
         return self._token(self._m2m_provider, ".default", "M2M", "Service principal authentication")

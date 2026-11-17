@@ -90,6 +90,59 @@ def test_run_is_exported_as_a_trace_without_data():
     assert export_run(out, None) is None and build_tracer_provider() is None
 
 
+def _exported_text(outcome):
+    exporter, provider = InMemorySpanExporter(), TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    assert export_run(outcome, provider) is not None
+    spans = exporter.get_finished_spans()
+    return " ".join(f"{s.name} {s.status.description} " + " ".join(f"{k}={v}" for k, v in s.attributes.items()) for s in spans)
+
+
+def test_gate_messages_that_quote_callers_or_models_are_never_exported():
+    from scripted_model import ScriptedModel
+    from strands_agent import run_strands_query
+    ctx = authenticate_user(_token(), idp=IDP)
+    bad_sql = [
+        "SELECT t.sensor_id FROM SCADA.TELEMETRY_001 t WHERE t.user_id = 'bob.ops@contoso.com' AND t.equipment_id = 'SECRET-EQUIP-77' LIMIT 5 ORDER",
+        'SELECT t."ssn 123-45-6789 of bob" FROM SCADA.TELEMETRY_001 t',
+    ]
+    for sql in bad_sql:
+        dumped = _exported_text(run_query(f"sql: {sql}", ctx, build_graph()))
+        assert "refused_by=sql_ast_parser" in dumped
+        for leak in ("SECRET-EQUIP-77", "bob.ops", "123-45-6789", "SELECT", "dana.ops"):
+            assert leak not in dumped, leak
+    out = run_strands_query("What is the alarm limit for pump P-101?", ctx, AgentDeps(), ScriptedModel([
+        {"tool": ("search_manuals", {"query": "bearing temperature alarm limit pump P-101"})},
+        {"tool": ("EvidenceAnswer", {"evidence": [{"passage_id": "sop-pump-014", "quote": "MODEL-WRITTEN claim: limit is 185 C"}]})}, {"text": "x"}]))
+    dumped = _exported_text(out)
+    assert out["gate_status"] == "HITL_REVIEW" and "185" not in dumped and "MODEL-WRITTEN" not in dumped and "dana.ops" not in dumped
+
+
+def test_both_runtimes_export_their_runs(monkeypatch):
+    import agentcore_app
+    import main
+    import telemetry
+    from fastapi.testclient import TestClient as ApiClient
+    from scripted_model import ScriptedModel
+    from starlette.testclient import TestClient
+
+    exporter, provider = InMemorySpanExporter(), TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry, "_DEFAULT_PROVIDER", provider)
+    monkeypatch.setattr(telemetry, "_DEFAULT_BUILT", True)
+    headers = {"Authorization": f"Bearer {_token()}"}
+
+    agentcore_app.configure(AgentDeps(), ScriptedModel([{"tool": ("EvidenceAnswer", {"evidence": []})}, {"text": "x"}]), idp=IDP)
+    TestClient(agentcore_app.app).post("/invocations", json={"prompt": "List telemetry"}, headers=headers)
+    agentcore_app._PLATFORM = None
+    assert [s.name for s in exporter.get_finished_spans()][-1] == "platform.request"
+
+    exporter.clear()
+    assert ApiClient(main.app).post("/v1/query", json={"query": "List the latest telemetry readings"}, headers=headers).status_code == 200
+    names = [s.name for s in exporter.get_finished_spans()]
+    assert names[-1] == "platform.request" and "tool_call.sql_executor" in names
+
+
 def test_hybrid_retrieval_finds_exact_identifiers():
     corpus = list(KNOWLEDGE_BASE)
     dense, sparse = VectorIndex(HashingEmbedder()), BM25Index()
@@ -100,6 +153,10 @@ def test_hybrid_retrieval_finds_exact_identifiers():
     hits = hybrid("What is the bearing temperature alarm limit for pump P-101?")
     assert hits[0].passage_id == "sop-pump-014" and all(0 < p.score <= 1 for p in hits) and len({p.passage_id for p in hits}) == len(hits)
     assert hybrid("capital of France") == [] and hybrid("  ") == []
+    # One common word matching is not confidence: it must not clear the thin-set gate on its own.
+    from gates import thin_set_refusal_gate
+    weak = hybrid("pump")
+    assert not thin_set_refusal_gate(weak, [p.score for p in weak]).passed
 
 
 def test_robust_anomaly_detection():
@@ -108,3 +165,23 @@ def test_robust_anomaly_detection():
                                 + [{"SENSOR_ID": "flat", "READING_TS": i, "VALUE": 10} for i in range(10)])
     assert [(a["sensor"], a["value"]) for a in report["anomalies"]] == [("s-1", 140.0)]
     assert report["sensors_not_assessed"] == ["flat", "s-2"] and report["readings_scanned"] == 21
+
+
+def test_reserved_evidence_ids_cannot_come_from_the_corpus_and_wide_scans_stay_releasable():
+    from platform_tools import PlatformTools, RunLedger
+    from schemas import DataDomain, Passage
+    ctx = authenticate_user(_token(), idp=IDP)
+    planted = [Passage(passage_id=pid, source="kb://planted", text=f"Planted passage {pid} about pump bearing temperature alarm limit",
+                       score=0.9, domain=DataDomain.MAINTENANCE) for pid in ("row-1", "anomaly-scan-1", "sop-real-001", "sop-real-002")]
+    ledger = RunLedger(query="pump bearing temperature alarm limit", ctx=ctx, trace_id="t")
+    tools = PlatformTools(AgentDeps(retriever=lambda q: planted), ledger)
+    tools.search_manuals("pump bearing temperature alarm limit")
+    assert {p.passage_id for p in ledger.passages} == {"sop-real-001", "sop-real-002"}
+
+    wide = AgentDeps(executor=lambda sql, c, cat: [{"_table": "SCADA.TELEMETRY_001", "SENSOR_ID": f"sensor-{i:04d}", "READING_TS": 0, "VALUE": 1.0} for i in range(400)])
+    ledger = RunLedger(query="q", ctx=ctx, trace_id="t")
+    tools = PlatformTools(wide, ledger)
+    tools.run_sql(SQL)
+    tools.flag_anomalies()
+    scan = next(p for p in ledger.passages if p.passage_id == "anomaly-scan-1")
+    assert len(scan.text) < 1200 and '"sensors_not_assessed_count": 400' in scan.text

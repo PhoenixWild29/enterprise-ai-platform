@@ -261,6 +261,7 @@ def _check_expression_policy(root: exp.Expression) -> None:
         if ident.quoted:
             # A quoted name is a different, case-sensitive object in Snowflake.
             raise SQLValidationError(f"Quoted identifier \"{ident.name}\" is not allowed.")
+    _check_projection_policy(root)
     for column in root.find_all(exp.Column):
         name = column.name.upper()
         if column.args.get("db") or column.args.get("catalog"):
@@ -269,6 +270,54 @@ def _check_expression_policy(root: exp.Expression) -> None:
             raise SQLValidationError(f"'{column.sql()}' is not allowed in governed queries.")
         if not column.table and name.startswith("CURRENT_"):
             raise SQLValidationError(f"Session context value '{name}' is not on the allowed list.")
+
+
+# Functions whose own arguments may be constants in a SELECT list (a rounding
+# precision, a date part, an interval). Everywhere else in a SELECT list a
+# constant is refused.
+_CONSTANT_ARGUMENT_FUNCTIONS: tuple[type[exp.Expression], ...] = tuple(
+    getattr(exp, name)
+    for name in ("Round", "DateTrunc", "TimestampTrunc", "DateAdd", "DateSub", "DateDiff", "TimestampAdd",
+                 "TimestampSub", "TimestampDiff", "TsOrDsAdd", "Extract", "Interval", "TimeSlice")
+    if hasattr(exp, name)
+)
+_ALIAS_WORDS = frozenset(
+    "total avg average min max sum count cnt n num number first last latest earliest mean median stddev distinct "
+    "daily hourly weekly monthly day hour week month year date bucket per by of rows".split()
+)
+MAX_ALIAS_CHARS = 40
+
+
+def _check_projection_policy(root: exp.Expression) -> None:
+    """Every value a query returns must come from table data.
+
+    Result rows are released to the user as evidence, so a query must not be
+    able to return text or numbers its author made up: no constants in a
+    SELECT list (outside a date part or rounding precision), every selected
+    expression must read a column, and an output name is built only from
+    column names in the query and a fixed set of aggregate words."""
+    column_words = {word for column in root.find_all(exp.Column) for word in column.name.lower().split("_") if word}
+    for select in root.find_all(exp.Select):
+        for projection in select.expressions:
+            value = projection.unalias()
+            for constant in projection.find_all(exp.Literal, exp.Boolean, exp.Null):
+                holder = constant.parent
+                while isinstance(holder, (exp.Paren, exp.Neg)):
+                    holder = holder.parent
+                if not isinstance(holder, _CONSTANT_ARGUMENT_FUNCTIONS):
+                    raise SQLValidationError(
+                        "Constants are not allowed in the SELECT list; select columns and aggregates of columns only."
+                    )
+            if not isinstance(value, exp.Star) and value.find(exp.Column, exp.Star) is None:
+                raise SQLValidationError("Every selected expression must read a table column.")
+            alias = projection.alias if isinstance(projection, exp.Alias) else ""
+            if alias:
+                words = [word for word in alias.lower().split("_") if word]
+                if len(alias) > MAX_ALIAS_CHARS or not all(w in _ALIAS_WORDS or w in column_words for w in words):
+                    raise SQLValidationError(
+                        f"Output name '{alias[:MAX_ALIAS_CHARS]}' is not allowed; name outputs after the columns they come "
+                        "from, with words such as total, avg, min, max or count."
+                    )
 
 
 def parse_read_only_sql(sql: str) -> exp.Expression:

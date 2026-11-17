@@ -115,8 +115,10 @@ def current_budget() -> RequestBudget | None:
 
 @contextmanager
 def request_budget(max_total_tokens: int | None = None) -> Iterator[RequestBudget]:
-    """Scope a token budget to one request. Model calls made inside the
-    block, on this thread or on threads started from it, count against it."""
+    """Scope a token budget to one request. Model calls made inside the block
+    count against it, on this thread and in work started with a copy of this
+    context (asyncio tasks, LangGraph nodes). A bare threading.Thread does not
+    copy the context, so calls made there are not budgeted."""
     ceiling = max_total_tokens or int(os.environ.get("MAX_TOKENS_PER_REQUEST", DEFAULT_MAX_TOKENS_PER_REQUEST))
     budget = RequestBudget(max_total_tokens=ceiling)
     token = _REQUEST_BUDGET.set(budget)

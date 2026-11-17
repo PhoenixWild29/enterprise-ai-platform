@@ -9,6 +9,8 @@ same whichever runtime calls it.
 
 import json
 import logging
+import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,6 +34,9 @@ logger = logging.getLogger("platform.tools")
 
 MAX_ROWS_SHOWN = 20
 MAX_ANOMALIES_CITED = 6
+MAX_SENSORS_LISTED = 10
+# Evidence ids the tools mint themselves. A corpus passage may not use one.
+_RESERVED_EVIDENCE_ID = re.compile(r"^(?:row-\d+|anomaly-scan-\d+)$")
 REFUSED = "REFUSED"
 
 
@@ -49,6 +54,7 @@ class RunLedger:
     audit: list[AuditEvent] = field(default_factory=list)
     halted: str | None = None  # set by a security violation: the run ends REFUSED whatever happens next
     tool_calls: int = 0
+    document_ids: set[str] = field(default_factory=set)  # passages that came from the document corpus
 
     def record(self, node: str, event_type: str, message: str, status: GateStatus | None = None, **detail: Any) -> None:
         self.audit.append(AuditEvent(node=node, event_type=event_type, status=status, message=message, detail=detail))  # type: ignore[arg-type]
@@ -65,6 +71,28 @@ class PlatformTools:
     def __init__(self, deps: AgentDeps, ledger: RunLedger) -> None:
         self._deps = deps
         self._ledger = ledger
+        self._lock = threading.Lock()  # one tool at a time: a halt is seen by every later call
+
+    def _entitled_passages(self, query: str) -> list[Passage]:
+        found = self._deps.retriever(query)
+        entitled = [
+            p for p in found
+            if p.domain is not None and p.domain in self._ledger.ctx.allowed_domains
+            and not _RESERVED_EVIDENCE_ID.match(p.passage_id)
+        ]
+        return sorted(entitled, key=lambda p: p.score, reverse=True)[:MAX_PASSAGES]
+
+    def documents_relevant_to_question(self) -> set[str]:
+        """Ids of the documents that clear the thin-set gate for the question
+        the caller actually asked. The agent chooses its own search strings;
+        only passages in this set may be released as an answer."""
+        try:
+            passages = self._entitled_passages(self._ledger.query)
+        except Exception:  # noqa: BLE001 - an outage releases nothing
+            logger.exception("retriever.failed")
+            return set()
+        gate = thin_set_refusal_gate(passages, [p.score for p in passages])
+        return {p.passage_id for p in passages} if gate.passed else set()
 
     # -- discovery ----------------------------------------------------------
 
@@ -83,25 +111,30 @@ class PlatformTools:
         """Retrieve passages from manuals and procedures. Returns nothing
         usable unless the evidence clears the thin-set gate."""
         ledger = self._ledger
+        if ledger.halted:
+            return f"{REFUSED}: {ledger.halted}"
         try:
-            found = self._deps.retriever(query)
+            passages = self._entitled_passages(query)
         except Exception as err:  # noqa: BLE001 - an outage is a refusal, not a crash
             logger.exception("retriever.failed")
             ledger.record("search_manuals", "tool_call", f"Retrieval failed ({type(err).__name__})", GateStatus.REFUSED)
             return f"{REFUSED}: evidence retrieval is unavailable."
-        entitled = [p for p in found if p.domain is not None and p.domain in ledger.ctx.allowed_domains]
-        passages = sorted(entitled, key=lambda p: p.score, reverse=True)[:MAX_PASSAGES]
         gate = thin_set_refusal_gate(passages, [p.score for p in passages])
         ledger.record_gate(gate)
         if not gate.passed:
             return f"{REFUSED} [{GATE_THIN_SET}]: " + " ".join(gate.reasons) + " Do not answer from memory."
         ledger.add_passages(passages)
+        ledger.document_ids.update(p.passage_id for p in passages)
         return "\n".join(f'<passage id="{as_data(p.passage_id)}">{as_data(p.text)}</passage>' for p in passages)
 
     # -- warehouse ----------------------------------------------------------
 
     def run_sql(self, sql: str) -> str:
         """Run one read-only SELECT through every SQL gate, as the caller."""
+        with self._lock:
+            return self._run_sql(sql)
+
+    def _run_sql(self, sql: str) -> str:
         ledger, catalog = self._ledger, self._deps.catalog
         if ledger.halted:
             return f"{REFUSED}: {ledger.halted}"
@@ -163,6 +196,8 @@ class PlatformTools:
         report = robust_z_anomalies(readings)
         report["anomaly_count"] = len(report["anomalies"])
         report["anomalies"] = report["anomalies"][:MAX_ANOMALIES_CITED]  # keep the evidence passage small enough to release whole
+        report["sensors_not_assessed_count"] = len(report["sensors_not_assessed"])
+        report["sensors_not_assessed"] = report["sensors_not_assessed"][:MAX_SENSORS_LISTED]
         scan_id = f"anomaly-scan-{sum(p.passage_id.startswith('anomaly-scan-') for p in ledger.passages) + 1}"
         passage = Passage(passage_id=scan_id, source="analysis://robust-z", text=json.dumps(report, sort_keys=True, default=str), score=1.0)
         ledger.add_passages([passage])

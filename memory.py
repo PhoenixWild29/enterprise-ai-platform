@@ -27,9 +27,12 @@ Stores: `InMemoryStore` for development and tests; `AgentCoreMemoryStore`
 persists USER and SESSION entries in Amazon Bedrock AgentCore Memory.
 """
 
+import hashlib
+import json
 import re
 import secrets
 import threading
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from html import escape
@@ -40,6 +43,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from auth import AuthContext, AuthPath
 
 MAX_MEMORY_CHARS = 500
+# How many live entries one owner may hold. Without a cap, memory grows without
+# bound and every entry is more text carried into every later prompt.
+MAX_ENTRIES_PER_OWNER = {"session": 20, "user": 50}
+MAX_PENDING_PER_AUTHOR = 20
 REVIEWER_SNOWFLAKE_ROLE = "PLATFORM_ADMIN"
 
 
@@ -94,14 +101,17 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("a bearer token or JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")),
     ("an AWS access key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
     ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
-    ("a credential", re.compile(r"(?i)\b(?:password|passwd|secret|api[_ -]?key|client[_ -]?secret|token)\b\s*(?:is|=|:)\s*\S+")),
+    ("a credential", re.compile(r"(?i)\b(?:password|passwd|passcode|pwd|pin|secret|api[_ -]?key|client[_ -]?secret|token|authorization)\b\s*(?:is|=|:)\s*\S+")),
+    ("a connection string with a password", re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@")),
+    ("a government id or card number", re.compile(r"\b\d{3}-\d{2}-\d{4}\b|\b(?:\d[ -]?){13,19}\b")),
     ("a long opaque secret", re.compile(r"\b[A-Za-z0-9+/_-]{40,}\b")),
 )
 _INSTRUCTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\b(?:ignore|disregard|forget|override)\b.{0,40}\b(?:previous|prior|above|earlier|all|any|system|safety|rules?|instructions?|polic(?:y|ies)|gates?)\b"),
-    re.compile(r"(?i)\b(?:you are now|act as|pretend to be|from now on you|new instructions?|system prompt|developer message)\b"),
-    re.compile(r"(?i)\b(?:always|never)\b.{0,60}\b(?:approve|refuse|cite|citation|limit|filter|row-level|security|authoriz|permission|entitle)"),
-    re.compile(r"(?i)\b(?:do not|don't|never|skip|bypass|disable)\b.{0,40}\b(?:check|verify|validat|gate|review|cite|limit|filter)"),
+    re.compile(r"(?i)\b(?:you are now|you (?:must|should|will|shall|need to|have to)|(?:you|please|to) act as|pretend to be|from now on|new instructions?|system prompt|developer message)\b"),
+    re.compile(r"(?i)\b(?:always|never)\b.{0,60}\b(?:approve|refuse|cite|citation|filter|row-level|security|authoriz|permission|entitle)"),
+    re.compile(r"(?i)\b(?:pre-?approved?|auto-?approve|without (?:review|approval|checking|citations?))\b"),
+    re.compile(r"(?i)\b(?:do not|don't|never|skip|bypass|disable)\b.{0,40}\b(?:checks?|verify|validat\w*|gates?|review|cit(?:e|ation)s?|row limits?|filters?)\b"),
     re.compile(r"(?i)</?\s*(?:system|assistant|user|instructions?|memory|tool)[^>]*>"),
 )
 _EVIDENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -115,9 +125,15 @@ class MemoryPolicy:
     """Decides what may be written, by whom, and in what status."""
 
     def check_text(self, text: str) -> str:
-        cleaned = " ".join(text.split())
+        # Fold look-alike forms before matching: compatibility characters become their plain
+        # equivalents and invisible format characters (zero-width joiners and the like) go.
+        folded = unicodedata.normalize("NFKC", text)
+        cleaned = " ".join("".join(ch for ch in folded if unicodedata.category(ch) != "Cf").split())
         if not cleaned:
             raise MemoryRefused("Empty memory.")
+        if any(_mixes_scripts(word) for word in cleaned.split()):
+            # A word spelled with letters from two alphabets is how a look-alike slips past a pattern.
+            raise MemoryRefused("Memory reads as an instruction to the agent; words that mix alphabets are not stored.")
         if len(cleaned) > MAX_MEMORY_CHARS:
             raise MemoryRefused(f"Memory is longer than {MAX_MEMORY_CHARS} characters.")
         for label, pattern in _SECRET_PATTERNS:
@@ -150,7 +166,7 @@ class MemoryPolicy:
     def may_review(self, record: MemoryRecord, reviewer: AuthContext) -> None:
         if reviewer.auth_path is not AuthPath.USER_OBO or reviewer.snowflake_role != REVIEWER_SNOWFLAKE_ROLE:
             raise MemoryRefused("Only a platform admin can review shared memory.")
-        if reviewer.principal == record.author:
+        if reviewer.principal.casefold() == record.author.casefold():
             raise MemoryRefused("Reviewers cannot approve their own memory proposals.")
 
 
@@ -198,13 +214,20 @@ class InMemoryStore:
 
 
 class AgentCoreMemoryStore(InMemoryStore):
-    """Persists USER and SESSION entries as events in AgentCore Memory, one
-    actor per user, so they survive restarts and are shared across replicas.
+    """Persists USER entries as events in AgentCore Memory, one actor per
+    user, so they survive the per-session runtime and are shared across
+    replicas. SESSION entries are written there too but only live for the
+    session that wrote them.
 
-    Shared PERSONA and ORG entries stay in the review-controlled store given
-    as `shared`, because AgentCore Memory has no approval state of its own.
+    Shared PERSONA and ORG entries are held in this process only: AgentCore
+    Memory has no approval state of its own, so they are not persisted until
+    there is a review-controlled store for them.
+
     Reads come from the local index, which `load_user` fills from AgentCore
-    at the start of a session.
+    at the start of each request. Stored events are treated as untrusted
+    input: on load, who owns an entry, who wrote it and when it expires are
+    decided here, not read from the event. Deleting writes a tombstone event,
+    so a forgotten entry stays forgotten after a restart.
     """
 
     def __init__(self, client: Any, memory_id: str) -> None:
@@ -218,35 +241,80 @@ class AgentCoreMemoryStore(InMemoryStore):
             self._client.create_event(
                 memory_id=self._memory_id,
                 actor_id=_actor_id(actor),
-                session_id=session or "user-profile",
+                session_id=session or USER_PROFILE_SESSION,
                 messages=[(record.model_dump_json(), "USER")],
             )
         super().put(record)
 
-    def load_user(self, principal: str, session_id: str = "user-profile") -> int:
-        """Rebuild this user's entries from AgentCore events. Entries that no
-        longer validate, or that the policy would now refuse, are skipped."""
-        policy, loaded = MemoryPolicy(), 0
-        events = self._client.list_events(memory_id=self._memory_id, actor_id=_actor_id(principal), session_id=session_id)
+    def delete(self, record_id: str) -> None:
+        record = self.get(record_id)
+        if record is not None and record.scope is MemoryScope.USER:
+            self._client.create_event(
+                memory_id=self._memory_id, actor_id=_actor_id(record.owner), session_id=USER_PROFILE_SESSION,
+                messages=[(json.dumps({"forget": record_id}), "USER")],
+            )
+        super().delete(record_id)
+
+    def load_user(self, principal: str) -> int:
+        """Rebuild this user's entries from AgentCore events and return how
+        many are live. Events are untrusted: an entry is kept only if it
+        validates, passes today's policy, belongs to this user, and does not
+        reuse the id of an entry that is not theirs."""
+        policy, now = MemoryPolicy(), datetime.now(UTC)
+        events = self._client.list_events(memory_id=self._memory_id, actor_id=_actor_id(principal), session_id=USER_PROFILE_SESSION)
+        candidates: dict[str, MemoryRecord] = {}
+        forgotten: set[str] = set()
         for event in events:
             for item in event.get("payload", []):
                 text = (item.get("conversational") or {}).get("content", {}).get("text")
                 if not text:
                     continue
                 try:
-                    record = MemoryRecord.model_validate_json(text)
-                    policy.check_text(record.text)
+                    raw = json.loads(text)
+                    if isinstance(raw, dict) and set(raw) == {"forget"}:
+                        forgotten.add(str(raw["forget"]))
+                        continue
+                    record = MemoryRecord.model_validate(raw)
+                    cleaned = policy.check_text(record.text)
                 except ValueError:
                     continue
-                if record.scope is MemoryScope.USER and record.owner == principal:
-                    InMemoryStore.put(self, record)
-                    loaded += 1
+                if record.scope is not MemoryScope.USER or record.owner != principal:
+                    continue
+                created = min(record.created_at, now)
+                candidates[record.record_id] = MemoryRecord(
+                    record_id=record.record_id, scope=MemoryScope.USER, owner=principal, text=cleaned,
+                    status=MemoryStatus.ACTIVE, author=principal, created_at=created,
+                    expires_at=min(record.expires_at, created + RETENTION[MemoryScope.USER]),
+                )
+        loaded = 0
+        for record_id, record in sorted(candidates.items(), key=lambda kv: kv[1].created_at, reverse=True):
+            existing = self.get(record_id)
+            if record_id in forgotten or not record.is_live(now):
+                if existing is not None and existing.scope is MemoryScope.USER and existing.owner == principal:
+                    InMemoryStore.delete(self, record_id)
+                continue
+            if existing is not None and (existing.scope is not MemoryScope.USER or existing.owner != principal):
+                continue  # never replace someone else's entry or a shared one
+            if loaded >= MAX_ENTRIES_PER_OWNER["user"]:
+                break
+            InMemoryStore.put(self, record)
+            loaded += 1
         return loaded
 
 
+USER_PROFILE_SESSION = "user-profile"
+
+
+def _mixes_scripts(word: str) -> bool:
+    letters = [ch for ch in word if ch.isalpha()]
+    return any(ch.isascii() for ch in letters) and any(not ch.isascii() for ch in letters)
+
+
 def _actor_id(principal: str) -> str:
-    """AgentCore actor ids are restricted to a safe character set."""
-    return re.sub(r"[^A-Za-z0-9_-]", "_", principal)[:128]
+    """AgentCore actor ids are restricted to a safe character set. A short
+    digest keeps two principals that differ only in punctuation apart."""
+    digest = hashlib.sha256(principal.encode()).hexdigest()[:12]
+    return f"{re.sub(r'[^A-Za-z0-9_-]', '_', principal)[:100]}-{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +334,19 @@ class MemoryService:
         """Write a memory. Shared scopes come back PENDING_REVIEW and are not
         recalled for anyone until a reviewer approves them."""
         cleaned = self.policy.check_text(text)
+        owner = self.policy.owner_for(scope, ctx, session_id)
+        status = self.policy.initial_status(scope, ctx)
+        now = datetime.now(UTC)
+        if scope.value in MAX_ENTRIES_PER_OWNER:
+            if sum(r.is_live(now) for r in self.store.by_owner(scope, owner)) >= MAX_ENTRIES_PER_OWNER[scope.value]:
+                raise MemoryRefused("Memory is full for this scope; delete an entry before adding another.")
+        elif sum(r.author == ctx.principal for r in self.store.pending()) >= MAX_PENDING_PER_AUTHOR:
+            raise MemoryRefused("Too many of your proposals are awaiting review.")
         record = MemoryRecord(
             scope=scope,
-            owner=self.policy.owner_for(scope, ctx, session_id),
+            owner=owner,
             text=cleaned,
-            status=self.policy.initial_status(scope, ctx),
+            status=status,
             author=ctx.principal,
             trace_id=trace_id,
             expires_at=datetime.now(UTC) + RETENTION[scope],

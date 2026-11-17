@@ -42,6 +42,7 @@ from auth import (
 from gates import MCP_TOOL_REGISTRY
 from graph import build_graph
 from bedrock_models import METER, request_budget
+from telemetry import default_provider, export_run
 from persistence import forget_thread, make_checkpointer
 from runtime import RuntimeConfig, build_agent_deps, catalog_problems
 from schemas import AuditEvent, Citation, GateStatus, new_state
@@ -211,6 +212,7 @@ def _run(query: str, ctx: AuthContext, include_audit: bool) -> QueryResponse:
         "query.done thread_id=%s principal=%s status=%s route=%s",
         thread_id, ctx.principal, out.get("gate_status"), out.get("route"),
     )
+    export_run(out, default_provider(), usage=budget.summary())
     return _to_response(thread_id, out, include_audit, budget.summary())
 
 
@@ -322,20 +324,22 @@ def review(
         if snapshot.values.get("principal") == reviewer.principal:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Reviewers cannot approve their own requests.")
         paused = False
-        try:
-            out = GRAPH.invoke(
-                Command(resume={"approved": body.approved, "reviewer": reviewer.principal, "comment": body.comment}),
-                config=_config(thread_id),
-            )
-            paused = bool(out.get("__interrupt__"))
-        finally:
-            if not paused:
-                forget_thread(CHECKPOINTER, thread_id)
+        with request_budget() as budget:  # a resumed run can call models too
+            try:
+                out = GRAPH.invoke(
+                    Command(resume={"approved": body.approved, "reviewer": reviewer.principal, "comment": body.comment}),
+                    config=_config(thread_id),
+                )
+                paused = bool(out.get("__interrupt__"))
+            finally:
+                if not paused:
+                    forget_thread(CHECKPOINTER, thread_id)
     logger.info(
         "review.done thread_id=%s reviewer=%s approved=%s status=%s",
         thread_id, reviewer.principal, body.approved, out.get("gate_status"),
     )
-    return _to_response(thread_id, out, include_audit)
+    export_run(out, default_provider(), usage=budget.summary())
+    return _to_response(thread_id, out, include_audit, budget.summary())
 
 
 @app.post("/v1/dev/token", response_model=DevTokenResponse)

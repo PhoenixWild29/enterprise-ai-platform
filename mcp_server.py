@@ -123,6 +123,17 @@ def build_server(deps: AgentDeps | None = None, verifier: PlatformTokenVerifier 
 
 
 if __name__ == "__main__":
-    from runtime import build_agent_deps
+    from auth import IDP
+    from runtime import RuntimeConfig, build_agent_deps, catalog_problems
 
-    build_server(build_agent_deps()).run(transport="streamable-http")
+    config = RuntimeConfig.from_env()
+    deps = build_agent_deps(config)
+    if os.environ.get("APP_ENV", "dev").strip().lower() not in {"dev", "development", "local", "test"}:
+        # Fail closed: this server reads the same data as the API, so it refuses the same stand-ins.
+        skip = ("AGENT_BACKEND", "MODEL_PROVIDER", "SYNTHESIS_MODE", "CHECKPOINT_BACKEND")
+        problems = [p for p in config.production_problems() if not p.startswith(skip)] + catalog_problems(config, deps.catalog)
+        if ACTIVE_IDP is IDP:
+            problems.append("IDENTITY_PROVIDER=agentcore or entra (the simulated provider signs its own tokens)")
+        if problems:
+            raise SystemExit("The MCP server will not start in production without: " + "; ".join(problems))
+    build_server(deps).run(transport="streamable-http")

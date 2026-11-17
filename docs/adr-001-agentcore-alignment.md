@@ -24,6 +24,11 @@ part that matters and the part that is expensive to get right.
 5. Models are called through Bedrock in the account's own VPC. Roles (routing, SQL, synthesis) can use
    different models. Every request has a token ceiling.
 6. Memory writes are gated like answers: a policy check, private by default, review before sharing.
+   The agent may not write memory once retrieved text is in its context.
+7. Identity comes only from a verified token. A scheduled job presents its own app-only token; a
+   job named in a request body is not an identity.
+8. Result rows are evidence, so the SQL gate refuses any query that could return a value its author
+   wrote (constants in a SELECT list, free-form output names).
 
 ## Consequences
 

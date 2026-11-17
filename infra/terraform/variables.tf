@@ -56,7 +56,61 @@ variable "memory_event_expiry_days" {
   description = "Retention for AgentCore Memory events."
 }
 
-variable "log_retention_days" {
-  type    = number
-  default = 90
+variable "entra_client_id" {
+  type        = string
+  description = "Application (client) id of the platform API's Entra app registration."
+}
+
+variable "snowflake_scope_prefix" {
+  type        = string
+  description = "Snowflake OAuth resource, for example api://<snowflake app id>."
+}
+
+variable "agent_model" {
+  type        = string
+  description = "Bedrock model id or inference profile the agent runs on. Must be covered by bedrock_model_arns."
+}
+
+variable "obo_credential_provider_name" {
+  type        = string
+  description = "AgentCore Identity credential provider used for the on-behalf-of exchange."
+}
+
+variable "m2m_credential_provider_name" {
+  type        = string
+  description = "AgentCore Identity credential provider used for scheduled jobs."
+}
+
+variable "identity_resource_arns" {
+  type        = list(string)
+  description = "ARNs of the workload identity, token vault and credential providers this agent may use."
+}
+
+variable "credential_secret_arns" {
+  type        = list(string)
+  description = "Secrets Manager ARNs holding the credential providers' client secrets."
+}
+
+variable "service_principals_json" {
+  type        = string
+  default     = "[]"
+  description = "Registered scheduled jobs: client id, service account, execution role and allowed DAG ids. Holds no secrets."
+}
+
+variable "catalog_path" {
+  type        = string
+  default     = "/app/deploy/catalog.json"
+  description = "Path in the image of the catalog exported from Snowflake (see the Dockerfile)."
+}
+
+variable "retriever_backend" {
+  type        = string
+  default     = "snowflake"
+  description = "Document retrieval backend."
+}
+
+variable "kms_key_arn" {
+  type        = string
+  default     = null
+  description = "Customer-managed KMS key for the image repository. AWS-managed encryption when null."
 }
