@@ -21,6 +21,7 @@ from typing import Any, Protocol
 
 from schemas import DataDomain, Passage
 
+OVERFETCH = 5
 _TABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*){0,2}$")
 _STOPWORDS = frozenset(
     "a an the is are was were what which who how why when where do does did for of on in to and or "
@@ -92,6 +93,8 @@ def load_corpus(path: str) -> list[Passage]:
                 passage = Passage.model_validate({"score": 0.0} | json.loads(line))
             except ValueError as err:
                 raise ValueError(f"{path}:{number}: invalid passage: {err}") from err
+            if passage.domain is None:
+                raise ValueError(f"{path}:{number}: passage has no domain, so entitlement cannot be checked")
             if passage.passage_id in seen:
                 raise ValueError(f"{path}:{number}: duplicate passage_id {passage.passage_id!r}")
             seen.add(passage.passage_id)
@@ -155,7 +158,9 @@ class SnowflakeVectorRetriever:
 
     Expects a table with columns PASSAGE_ID, SOURCE, TEXT, DOMAIN and
     EMBEDDING VECTOR(FLOAT, 768) built with the same embedding model.
-    Entitlement filtering by data domain happens in the graph, after retrieval.
+    Entitlement filtering by data domain happens in the graph, after retrieval,
+    so this over-fetches and the graph keeps the best few the caller may see.
+    Rows with no recognised domain are never returned.
     """
 
     def __init__(
@@ -175,7 +180,7 @@ class SnowflakeVectorRetriever:
         sql = (
             "SELECT passage_id, source, text, domain, "
             "VECTOR_COSINE_SIMILARITY(embedding, SNOWFLAKE.CORTEX.EMBED_TEXT_768(%s, %s)) AS score "
-            f"FROM {self._table} ORDER BY score DESC LIMIT {int(self._top_k)}"
+            f"FROM {self._table} WHERE domain IS NOT NULL ORDER BY score DESC LIMIT {int(self._top_k) * OVERFETCH}"
         )
         conn = self._connect()
         try:
@@ -190,9 +195,9 @@ class SnowflakeVectorRetriever:
         passages: list[Passage] = []
         for passage_id, source, text, domain, score in rows:
             try:
-                domain_value = DataDomain(str(domain).upper()) if domain else None
+                domain_value = DataDomain(str(domain or "").strip().upper())
             except ValueError:
-                continue  # unknown domain cannot be entitlement-checked: drop it
+                continue  # missing or unknown domain cannot be entitlement-checked: drop it
             if text:
                 passages.append(
                     Passage(passage_id=str(passage_id), source=str(source), text=str(text),

@@ -71,7 +71,7 @@ def test_executor_runs_with_the_callers_own_token_and_closes_everything():
 
     rows = SnowflakeExecutor(factory)(SQL, ctx, DEFAULT_CATALOG)
     role, token = seen[0]
-    assert role == "OPS_ANALYST" and token == TOKEN_VAULT.get(ctx.token_fingerprint).access_token and token.count(".") == 2
+    assert role == "OPS_ANALYST" and token == TOKEN_VAULT.get(ctx.token_fingerprint, ctx.principal).access_token and token.count(".") == 2
     assert conn.executed == [(SQL, None)] and conn.closed and conn.cursors[0].closed
     assert rows == [
         {"_table": "SCADA.TELEMETRY_001", "SENSOR_ID": "s-1", "READING_TS": "2026-11-16T08:00:00+00:00", "VALUE": 71.5},
@@ -99,17 +99,43 @@ def test_executor_closes_connection_on_failure_and_caps_rows():
     with pytest.raises(RuntimeError):
         SnowflakeExecutor(lambda c, t: conn)(SQL, ctx, DEFAULT_CATALOG)
     assert conn.closed and conn.cursors[0].closed
-    many = (_cols("sensor_id"), [(f"s-{i}",) for i in range(50)])
-    assert len(SnowflakeExecutor(lambda c, t: FakeConn([many]), max_rows=7)(SQL, ctx, DEFAULT_CATALOG)) == 7
+    def rows(n):
+        return (_cols("sensor_id"), [(f"s-{i}",) for i in range(n)])
+
+    assert len(SnowflakeExecutor(lambda c, t: FakeConn([rows(7)]), max_rows=7)(SQL, ctx, DEFAULT_CATALOG)) == 7
+    with pytest.raises(ValueError, match="row cap"):  # never silently truncated
+        SnowflakeExecutor(lambda c, t: FakeConn([rows(8)]), max_rows=7)(SQL, ctx, DEFAULT_CATALOG)
+    with pytest.raises(ValueError, match="duplicate column"):
+        SnowflakeExecutor(lambda c, t: FakeConn([(_cols("id", "ID"), [(1, 2)])]))(SQL, ctx, DEFAULT_CATALOG)
 
 
 def test_expired_vault_token_is_refused_and_purged():
     from auth import DownstreamToken
     vault = TokenVault()
-    fp = vault.put(DownstreamToken(access_token="tok", expires_at=dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)))
+    fp = vault.put(DownstreamToken(access_token="tok", expires_at=dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)), "a@x.com")
     with pytest.raises(Exception, match="sign in again"):
-        vault.get(fp)
+        vault.get(fp, "a@x.com")
     assert len(vault) == 0
+
+
+def test_a_token_is_only_usable_by_the_principal_it_was_issued_to():
+    alice = _operator()
+    bob = authenticate_user(IDP.issue_user_token("bob.ops@contoso.com", "oid-2", ["Lakehouse.Operator"]), idp=IDP)
+    forged = bob.model_copy(update={"token_fingerprint": alice.token_fingerprint})  # Bob's identity, Alice's token
+    calls = []
+    with pytest.raises(PermissionError, match="session unavailable"):
+        SnowflakeExecutor(lambda c, t: calls.append(1) or FakeConn([TELEMETRY]))(SQL, forged, DEFAULT_CATALOG)
+    assert calls == []
+
+
+def test_executor_does_not_trust_a_cte_name_defined_elsewhere():
+    ctx, calls = _operator(), []
+    shadow = ("SELECT (SELECT COUNT(*) FROM PAYROLL), w.work_order_id FROM MAINT.WORK_ORDERS_000 w "
+              "WHERE w.opened_at >= '2026-01-01' AND w.work_order_id IN (WITH PAYROLL AS (SELECT 1 AS a) SELECT a FROM PAYROLL)")
+    with pytest.raises(PermissionError, match="outside the catalog"):
+        SnowflakeExecutor(lambda c, t: calls.append(1) or FakeConn([TELEMETRY]))(shadow, ctx, DEFAULT_CATALOG)
+    out = run_query(f"sql: {shadow}", ctx, build_graph(AgentDeps(executor=SnowflakeExecutor(lambda c, t: calls.append(1) or FakeConn([TELEMETRY])))))
+    assert out["gate_status"] == "REFUSED" and calls == []
 
 
 def test_graph_end_to_end_on_snowflake_executor_and_warehouse_failure():
@@ -128,6 +154,7 @@ def test_graph_end_to_end_on_snowflake_executor_and_warehouse_failure():
     graph = build_graph(AgentDeps(executor=SnowflakeExecutor(lambda c, t: FakeConn(fail=True))))
     out = run_query("List the latest telemetry readings", _operator(), graph)
     assert out["gate_status"] == "REFUSED" and "Execution failed" in out["refusal_reason"] and not out["execution_results"]
+    assert "warehouse unavailable" not in out["final_response"]  # connector messages stay in the server log
 
 
 OVERLAY = GovernanceOverlay(
@@ -179,6 +206,11 @@ def test_catalog_loader_fails_closed():
         load_catalog(FakeConn([COLUMNS, PKS, FKS]), "LAKEHOUSE", bad_col)
     with pytest.raises(ValueError, match="Invalid database"):
         load_catalog(FakeConn(), "LAKEHOUSE; DROP TABLE X", OVERLAY)
+    twins = (COLUMNS[0], COLUMNS[1] + [("SCADA", "pump_readings", "READING_ID")])
+    with pytest.raises(ValueError, match="differ only by case"):
+        load_catalog(FakeConn([twins, PKS, FKS]), "LAKEHOUSE", OVERLAY)
+    ghost_fk = (FKS[0], FKS[1] + [("MAINT", "EQUIPMENT", "EQUIPMENT_ID", "SCADA", "PUMP_READINGS", "NO_SUCH_COLUMN")])
+    assert len(load_catalog(FakeConn([COLUMNS, PKS, ghost_fk]), "LAKEHOUSE", OVERLAY).get("SCADA.PUMP_READINGS").foreign_keys) == 1
     with pytest.raises(ValueError, match="No tables"):
         load_catalog(FakeConn([(COLUMNS[0], []), PKS, FKS]), "LAKEHOUSE", OVERLAY)
 

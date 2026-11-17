@@ -3,6 +3,7 @@
 Endpoints
   POST /v1/query               user path (Bearer JWT -> OBO -> graph)
   POST /v1/jobs/query          headless path (service principal + Airflow run id)
+  GET  /v1/review/{thread_id}  what a reviewer is asked to approve
   POST /v1/review/{thread_id}  human-in-the-loop decision on a paused run
   GET  /v1/tools               MCP tool definitions
   GET  /healthz                liveness and catalog size
@@ -20,6 +21,7 @@ Run:  uvicorn main:app --reload
 
 import logging
 import os
+import threading
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -40,7 +42,7 @@ from auth import (
 from gates import MCP_TOOL_REGISTRY
 from graph import build_graph
 from persistence import forget_thread, make_checkpointer
-from runtime import RuntimeConfig, build_agent_deps
+from runtime import RuntimeConfig, build_agent_deps, catalog_problems
 from schemas import AuditEvent, Citation, GateStatus, new_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -65,8 +67,10 @@ if IS_PRODUCTION:
     if problems:
         raise RuntimeError(f"APP_ENV={APP_ENV} is treated as production and requires: " + "; ".join(problems))
 
-CHECKPOINTER = make_checkpointer(CHECKPOINT_BACKEND)
 DEPS = build_agent_deps(RUNTIME)
+if IS_PRODUCTION and (problems := catalog_problems(RUNTIME, DEPS.catalog)):
+    raise RuntimeError(f"APP_ENV={APP_ENV} is treated as production and requires: " + "; ".join(problems))
+CHECKPOINTER = make_checkpointer(CHECKPOINT_BACKEND)
 GRAPH_CATALOG = DEPS.catalog
 GRAPH = build_graph(DEPS, checkpointer=CHECKPOINTER)
 logger.info(
@@ -192,9 +196,13 @@ def _run(query: str, ctx: AuthContext, include_audit: bool) -> QueryResponse:
     state = new_state(query)
     state["auth_context"] = ctx.model_dump(mode="json")
     thread_id = state["trace_id"]
-    out = GRAPH.invoke(state, config=_config(thread_id))
-    if not out.get("__interrupt__"):
-        forget_thread(CHECKPOINTER, thread_id)  # keep state on disk only while a reviewer is pending
+    paused = False
+    try:
+        out = GRAPH.invoke(state, config=_config(thread_id))
+        paused = bool(out.get("__interrupt__"))
+    finally:
+        if not paused:  # keep state on disk only while a reviewer is pending, also when the run crashed
+            forget_thread(CHECKPOINTER, thread_id)
     logger.info(
         "query.done thread_id=%s principal=%s status=%s route=%s",
         thread_id, ctx.principal, out.get("gate_status"), out.get("route"),
@@ -244,28 +252,73 @@ def job_query(body: JobQueryRequest, include_audit: bool = Query(default=False))
     return _run(body.query, ctx, include_audit)
 
 
+class PendingReview(BaseModel):
+    thread_id: str
+    ticket: str
+    requested_by: str | None
+    query: str | None
+    draft_response: str | None
+    reason: str | None
+    citations: list[Citation]
+
+
+def _reviewer(ctx: AuthContext = Depends(current_user)) -> AuthContext:
+    if ctx.snowflake_role != APP_ROLE_TO_SNOWFLAKE_ROLE[REVIEWER_ROLE]:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Reviewing requires the {REVIEWER_ROLE} role.")
+    return ctx
+
+
+def _pending(thread_id: str) -> Any:
+    snapshot = GRAPH.get_state(_config(thread_id))
+    if not snapshot.next or not any(task.interrupts for task in snapshot.tasks):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No run is awaiting review for this thread.")
+    return snapshot
+
+
+@app.get("/v1/review/{thread_id}", response_model=PendingReview)
+def get_review(thread_id: str, reviewer: AuthContext = Depends(_reviewer)) -> PendingReview:
+    """What the reviewer is being asked to approve: the draft, its citations and why it was held."""
+    snapshot = _pending(thread_id)
+    payload = next(i.value for task in snapshot.tasks for i in task.interrupts)
+    values = snapshot.values
+    return PendingReview(
+        thread_id=thread_id, ticket=payload["ticket"], requested_by=values.get("principal"),
+        query=values.get("query"), draft_response=values.get("draft_response"),
+        reason=payload.get("reason"), citations=values.get("citations", []),
+    )
+
+
+_REVIEW_LOCKS: dict[str, threading.Lock] = {}
+_REVIEW_LOCKS_GUARD = threading.Lock()
+
+
 @app.post("/v1/review/{thread_id}", response_model=QueryResponse, response_model_exclude_none=True)
 def review(
     thread_id: str,
     body: ReviewRequest,
     include_audit: bool = Query(default=False),
-    reviewer: AuthContext = Depends(current_user),
+    reviewer: AuthContext = Depends(_reviewer),
 ) -> QueryResponse:
     """Approve or reject a paused run. The reviewer's identity comes from
-    their token, must hold the admin role, and must not be the requester."""
-    if reviewer.snowflake_role != APP_ROLE_TO_SNOWFLAKE_ROLE[REVIEWER_ROLE]:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Reviewing requires the {REVIEWER_ROLE} role.")
-    snapshot = GRAPH.get_state(_config(thread_id))
-    if not snapshot.next or not any(task.interrupts for task in snapshot.tasks):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "No run is awaiting review for this thread.")
-    if snapshot.values.get("principal") == reviewer.principal:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Reviewers cannot approve their own requests.")
-    out = GRAPH.invoke(
-        Command(resume={"approved": body.approved, "reviewer": reviewer.principal, "comment": body.comment}),
-        config=_config(thread_id),
-    )
-    if not out.get("__interrupt__"):
-        forget_thread(CHECKPOINTER, thread_id)
+    their token, must hold the admin role, and must not be the requester.
+    Decisions on one run are serialised in this process, so the first one
+    wins; run a single API replica or add a database lock before scaling out."""
+    with _REVIEW_LOCKS_GUARD:
+        lock = _REVIEW_LOCKS.setdefault(thread_id, threading.Lock())
+    with lock:
+        snapshot = _pending(thread_id)  # checked under the lock: a decided run is gone
+        if snapshot.values.get("principal") == reviewer.principal:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Reviewers cannot approve their own requests.")
+        paused = False
+        try:
+            out = GRAPH.invoke(
+                Command(resume={"approved": body.approved, "reviewer": reviewer.principal, "comment": body.comment}),
+                config=_config(thread_id),
+            )
+            paused = bool(out.get("__interrupt__"))
+        finally:
+            if not paused:
+                forget_thread(CHECKPOINTER, thread_id)
     logger.info(
         "review.done thread_id=%s reviewer=%s approved=%s status=%s",
         thread_id, reviewer.principal, body.approved, out.get("gate_status"),

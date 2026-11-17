@@ -25,6 +25,8 @@ class RuntimeConfig:
     warehouse_backend: str
     retriever_backend: str
     catalog_source: str
+    synthesis_mode: str = "extractive"
+    corpus_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -33,6 +35,8 @@ class RuntimeConfig:
             warehouse_backend=os.environ.get("WAREHOUSE_BACKEND", "simulated").lower(),
             retriever_backend=os.environ.get("RETRIEVER_BACKEND", "keyword").lower(),
             catalog_source=os.environ.get("CATALOG_PATH") or "demo",
+            synthesis_mode=os.environ.get("SYNTHESIS_MODE", "extractive").lower(),
+            corpus_path=os.environ.get("CORPUS_PATH") or None,
         )
 
     def production_problems(self) -> list[str]:
@@ -44,6 +48,10 @@ class RuntimeConfig:
             problems.append("WAREHOUSE_BACKEND=snowflake (the simulated executor returns synthetic rows)")
         if self.retriever_backend == "keyword":
             problems.append("RETRIEVER_BACKEND=vector or snowflake (the keyword retriever uses sample passages)")
+        if self.retriever_backend == "vector" and not self.corpus_path:
+            problems.append("CORPUS_PATH (without it the vector retriever indexes the sample passages)")
+        if self.synthesis_mode != "extractive":
+            problems.append("SYNTHESIS_MODE=extractive (abstractive mode releases model-written text)")
         if self.catalog_source == "demo":
             problems.append("CATALOG_PATH (the demo catalog is generated, not your lakehouse)")
         return problems
@@ -74,6 +82,18 @@ def load_catalog(config: RuntimeConfig) -> Catalog:
     return load_catalog_file(config.catalog_source)
 
 
+def catalog_problems(config: RuntimeConfig, catalog: Catalog) -> list[str]:
+    """Catalog checks a production process must pass."""
+    problems: list[str] = []
+    if catalog.tables.keys() == DEFAULT_CATALOG.tables.keys():
+        problems.append("a catalog exported from your lakehouse (CATALOG_PATH holds the demo catalog)")
+    if config.warehouse_backend == "snowflake":
+        database = os.environ.get("SNOWFLAKE_DATABASE", "LAKEHOUSE").upper()
+        if catalog.database.upper() != database:
+            problems.append(f"SNOWFLAKE_DATABASE to match the catalog's database ({catalog.database})")
+    return problems
+
+
 def build_agent_deps(config: RuntimeConfig | None = None) -> AgentDeps:
     config = config or RuntimeConfig.from_env()
     catalog = load_catalog(config)
@@ -84,7 +104,7 @@ def build_agent_deps(config: RuntimeConfig | None = None) -> AgentDeps:
         case "llm":
             from llm_agents import build_llm_deps
 
-            mode = os.environ.get("SYNTHESIS_MODE", "extractive").lower()
+            mode = config.synthesis_mode
             if mode not in ("extractive", "abstractive"):
                 raise RuntimeError(f"Unknown SYNTHESIS_MODE '{mode}' (use extractive or abstractive).")
             deps = build_llm_deps(_lazy_anthropic_completion(), catalog, synthesis_mode=mode)
@@ -107,9 +127,8 @@ def build_agent_deps(config: RuntimeConfig | None = None) -> AgentDeps:
         case "vector":
             from retrieval import HashingEmbedder, VectorIndex, VectorRetriever, load_corpus
 
-            path = os.environ.get("CORPUS_PATH")
             index = VectorIndex(HashingEmbedder())
-            index.add(load_corpus(path) if path else list(KNOWLEDGE_BASE))
+            index.add(load_corpus(config.corpus_path) if config.corpus_path else list(KNOWLEDGE_BASE))
             deps = replace(deps, retriever=VectorRetriever(index))
         case "snowflake":
             from retrieval import SnowflakeVectorRetriever

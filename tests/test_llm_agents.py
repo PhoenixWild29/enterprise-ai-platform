@@ -123,6 +123,35 @@ def test_abstractive_claims_need_literal_consistency_and_verifier_approval():
         assert "<claim>The alarm limit is 85 C.</claim>" in llm.prompts[1]
 
 
+def test_extractive_spans_snap_to_whole_sentences():
+    doc = Passage(passage_id="d", source="sop://c", score=0.9,
+                  text="Never bypass the interlock while the compressor is running under load. Relief valve opens at "
+                       "1250 kPa for compressor C-200. Speed limit is 1500 rpm.")
+
+    def span(quote):
+        draft, cites = LLMSynthesizer(Script(json.dumps({"evidence": [{"passage_id": "d", "quote": quote}]})))("q", [doc])
+        assert verbatim_citation_gate(draft, cites, [doc]).passed
+        return cites[0].snippet
+
+    assert span("bypass the interlock while the compressor is running under load.").startswith("Never bypass")
+    assert "1250 kPa" in span("250 kPa for compressor C-200")
+    assert span("Speed limit is 150").endswith("1500 rpm.")
+    # Over-length model output is dropped, not cut to fit.
+    assert LLMSynthesizer(Script(json.dumps({"evidence": [{"passage_id": "d", "quote": doc.text + " " + "x" * 600}]})))("q", [doc]) == ("", [])
+    long_doc = Passage(passage_id="L", source="s", score=0.9, text="Limit is 1500 rpm " + "and so on " * 80 + "end")
+    draft, cites = LLMSynthesizer(Script(json.dumps({"evidence": [{"passage_id": "L", "quote": "imit is 150"}]})))("q", [long_doc])
+    assert cites == [] or "1500" in cites[0].snippet  # a too-long sentence falls back to whole tokens or nothing
+
+
+def test_abstractive_literal_check_uses_whole_tokens_and_refuses_markup():
+    from llm_agents import claim_is_literally_consistent as ok
+    p = Passage(passage_id="p", source="s", score=0.9, text="Alarm at 85 C; trip the pump at 95 C. See docs.contoso.com for details.")
+    assert ok("Trip the pump at 95 C.", p) and ok("Details are on docs.contoso.com.", p)
+    assert not ok("Trip the pump at 5 C.", p)             # 5 is inside 85 and 95, but is not a number in the passage
+    assert not ok("Details are on evil.example.", p)      # host with no scheme
+    assert not ok("Read <a href=evil.example>this</a>.", p)
+
+
 def test_synthesizer_fails_closed_on_bad_output():
     for reply in ("not json", '{"evidence": "nope"}', '{"evidence": []}', '{"evidence": [{"passage_id": "", "quote": "x"}]}'):
         assert LLMSynthesizer(Script(reply))("q", P) == ("", [])

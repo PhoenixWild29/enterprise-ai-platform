@@ -232,7 +232,8 @@ class LLMSQLGenerator:
 
 SNIPPET_CHARS = 40
 MAX_EVIDENCE_ITEMS = 5
-MAX_QUOTE_CHARS = 400
+MAX_SPAN_CHARS = 600
+UNVERIFIED_MARK = "[unverified]"
 
 type ClaimVerifier = Callable[[str, Passage], bool]
 
@@ -240,13 +241,21 @@ _NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
 _LINK = re.compile(r"(?:https?://|www\.)\S+", flags=re.IGNORECASE)
 
 
+_DOMAIN = re.compile(r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b", flags=re.IGNORECASE)
+
+
 def claim_is_literally_consistent(claim: str, passage: Passage) -> bool:
-    """Deterministic floor for abstractive claims: every number and link in
-    the claim must appear in the cited passage."""
-    text = passage.text
-    numbers_ok = all(n in text for n in _NUMBER.findall(claim))
-    links_ok = all(link.rstrip(".,;)") in text for link in _LINK.findall(claim))
-    return numbers_ok and links_ok
+    """Deterministic floor for abstractive claims: every number, link and
+    host name in the claim must appear in the cited passage as a whole token,
+    and the claim must carry no markup. It cannot judge meaning; that is the
+    verifier's job, which is why abstractive mode is not for production."""
+    if "<" in claim or ">" in claim:
+        return False
+    passage_numbers = set(_NUMBER.findall(passage.text))
+    numbers_ok = all(n in passage_numbers for n in _NUMBER.findall(claim))
+    links_ok = all(link.rstrip(".,;)") in passage.text for link in _LINK.findall(claim))
+    hosts_ok = all(host.lower() in passage.text.lower() for host in _DOMAIN.findall(claim))
+    return numbers_ok and links_ok and hosts_ok
 
 
 def llm_claim_verifier(complete: Completion) -> ClaimVerifier:
@@ -315,15 +324,35 @@ class LLMSynthesizer:
 
     @staticmethod
     def _extract_span(quote: str, passage: Passage) -> str | None:
-        """The model's quote if it is verbatim in the passage, widened to the
-        minimum citation length; None if it is not verbatim."""
+        """Widen a verbatim quote to whole sentences of the passage, so a span
+        can never start or stop inside a number or drop the word that negates
+        it. Falls back to whole whitespace-delimited tokens when the sentences
+        are too long. Returns None when the quote is not verbatim or no
+        acceptable span exists."""
         text = passage.text
         start = text.find(quote)
         if start < 0:
             return None
+        end = start + len(quote)
         required = min(SNIPPET_CHARS, len(text))
-        span = text[start : start + max(len(quote), required)]
-        return span if len(span) >= required else text[-required:]
+
+        sentence_start = max((text.rfind(mark, 0, start) for mark in (". ", "! ", "? ", "\n")), default=-1)
+        sentence_start = 0 if sentence_start < 0 else sentence_start + (1 if text[sentence_start] == "\n" else 2)
+        stops = [i + 1 for mark in (". ", "! ", "? ") if (i := text.find(mark, max(end - 1, 0))) >= 0]
+        newline = text.find("\n", end)
+        sentence_end = min(stops + ([newline] if newline >= 0 else []), default=len(text))
+        span = text[sentence_start:sentence_end].strip()
+        if len(span) < required:  # a very short sentence: take the whole passage if it is small
+            span = text.strip()
+        if len(span) <= MAX_SPAN_CHARS:
+            return span if len(span) >= required else None
+
+        # Sentences too long to release whole: snap the quote itself to token boundaries.
+        token_start = text.rfind(" ", 0, start) + 1
+        token_end = text.find(" ", end)
+        token_end = len(text) if token_end < 0 else token_end
+        span = text[token_start:token_end]
+        return span if required <= len(span) <= MAX_SPAN_CHARS else None
 
     def __call__(self, query: str, passages: list[Passage]) -> tuple[str, list[Citation]]:
         try:
@@ -341,18 +370,26 @@ class LLMSynthesizer:
             if not isinstance(item, dict):
                 continue
             passage_id = str(item.get("passage_id", "")).strip()
-            body = html.unescape(str(item.get(field, ""))).strip()[:MAX_QUOTE_CHARS]
-            if not passage_id or not body:
+            raw = str(item.get(field, "")).strip()
+            if not passage_id or not raw:
                 continue
+            if len(raw) > MAX_SPAN_CHARS:
+                continue  # over-length items are dropped whole, never cut to fit
             passage = by_id.get(passage_id)
             if self._mode == "extractive":
-                span = self._extract_span(body, passage) if passage else None
-                # A quote that is not verbatim, or that names an unretrieved passage, is cited
-                # as written on purpose: the citation gate must see it and refuse.
-                snippet = span if span is not None else body
+                body = html.unescape(raw)
+                if passage is None or body not in passage.text:
+                    # Not verbatim, or an unretrieved passage: cited as written on purpose,
+                    # with a marker no passage contains, so the citation gate must refuse it.
+                    snippet = f"{UNVERIFIED_MARK} {body}"
+                else:
+                    span = self._extract_span(body, passage)
+                    if span is None:
+                        continue  # verbatim but no releasable whole-sentence span
+                    snippet = span
                 lines.append(f'- "{snippet}" [{passage_id}]')
             else:
-                claim = " ".join(body.split())
+                claim = " ".join(raw.split())
                 supported = (
                     passage is not None
                     and claim_is_literally_consistent(claim, passage)
@@ -361,7 +398,7 @@ class LLMSynthesizer:
                 )
                 # An unsupported claim is cited with its own text, which is not in the passage,
                 # so the citation gate refuses and the draft goes to human review.
-                snippet = passage.text[:SNIPPET_CHARS] if supported and passage else claim[:MAX_QUOTE_CHARS]
+                snippet = passage.text[:SNIPPET_CHARS] if supported and passage else f"{UNVERIFIED_MARK} {claim}"
                 lines.append(f'- {claim} "{snippet}" [{passage_id}]' if supported else f"- {claim} [{passage_id}]")
             citations.append(Citation(passage_id=passage_id, snippet=snippet))
         if not lines:

@@ -17,6 +17,7 @@ deterministic simulations so the graph runs with no LLM or Snowflake account.
 """
 
 import json
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -79,6 +80,8 @@ N_CITE = "citation_gate"
 N_HITL = "hitl_review"
 N_RESPOND = "respond"
 N_REFUSAL = "refusal"
+
+logger = logging.getLogger("platform.graph")
 
 type RouterFn = Callable[[str], Route]
 type Retriever = Callable[[str], list[Passage]]
@@ -332,11 +335,21 @@ def make_supervisor(deps: AgentDeps) -> Callable[[AgentState], dict[str, Any]]:
     return supervisor_router
 
 
+MAX_PASSAGES = 4
+
+
 def _retrieve(state: AgentState, deps: AgentDeps, node: str) -> dict[str, Any]:
     ctx = _ctx(state)
-    found = deps.retriever(state["query"])
-    passages = [p for p in found if p.domain is None or p.domain in ctx.allowed_domains]
+    try:
+        found = deps.retriever(state["query"])
+    except Exception as err:  # noqa: BLE001 - a retriever outage is a refusal, not a crash
+        logger.exception("retriever.failed node=%s", node)
+        return _refuse(node, f"Evidence retrieval failed ({type(err).__name__}).")
+    # A passage with no domain cannot be entitlement-checked, so it is not shown to anyone.
+    entitled = [p for p in found if p.domain is not None and p.domain in ctx.allowed_domains]
+    passages = sorted(entitled, key=lambda p: p.score, reverse=True)[:MAX_PASSAGES]
     return {
+        "gate_status": GateStatus.PASSED,
         "raw_passages": passages,
         "confidence_scores": [p.score for p in passages],
         "audit_telemetry": [
@@ -377,6 +390,8 @@ def make_diagnostic_reasoner(deps: AgentDeps) -> Callable[[AgentState], dict[str
 
     def diagnostic_reasoner(state: AgentState) -> dict[str, Any]:
         update = _retrieve(state, deps, N_DIAG)
+        if update["gate_status"] != GateStatus.PASSED:
+            return update
         sql_update = _generate_sql(state, deps, N_DIAG, Route.DIAGNOSTIC)
         events = update["audit_telemetry"] + sql_update["audit_telemetry"]
         return update | sql_update | {"audit_telemetry": events}
@@ -401,7 +416,9 @@ def make_sql_executor(deps: AgentDeps) -> Callable[[AgentState], dict[str, Any]]
             secured_sql = apply_row_level_security(state["generated_sql"] or "", ctx, deps.catalog)
             rows = deps.executor(secured_sql, ctx, deps.catalog)
         except Exception as err:  # noqa: BLE001 - execution errors never leak partial data
-            return _refuse(N_EXEC, f"Execution failed ({type(err).__name__}): {err}")
+            # Warehouse messages can name objects the caller may not know exist: log them, do not return them.
+            logger.exception("executor.failed")
+            return _refuse(N_EXEC, f"Execution failed ({type(err).__name__}).")
         if not rows and state.get("route") == Route.TEXT_TO_SQL:
             return _refuse(N_EXEC, "Query returned no rows; there is no evidence to answer from.")
         row_passages = _rows_to_passages(rows)
@@ -556,8 +573,8 @@ def build_graph(
     g.add_conditional_edges(N_AUTH, _pass_or_refuse(N_SUPERVISOR), [N_SUPERVISOR, N_REFUSAL])
     g.add_conditional_edges(N_SUPERVISOR, _after_supervisor, [N_RAG, N_SQL, N_DIAG, N_REFUSAL])
 
-    g.add_edge(N_RAG, N_THIN)
-    g.add_edge(N_DIAG, N_THIN)
+    g.add_conditional_edges(N_RAG, _pass_or_refuse(N_THIN), [N_THIN, N_REFUSAL])
+    g.add_conditional_edges(N_DIAG, _pass_or_refuse(N_THIN), [N_THIN, N_REFUSAL])
     g.add_conditional_edges(N_THIN, _after_thin_set, [N_SYNTH, N_AST, N_REFUSAL])
 
     g.add_edge(N_SQL, N_AST)

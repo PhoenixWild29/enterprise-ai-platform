@@ -46,6 +46,7 @@ def sqlite_checkpointer(path: str | os.PathLike[str] = DEFAULT_SQLITE_PATH) -> B
     os.chmod(db_path, 0o600)
     # FastAPI runs sync endpoints on a thread pool; SqliteSaver serialises access itself.
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA secure_delete = ON")  # deleted checkpoints are overwritten, not just unlinked
     saver = SqliteSaver(conn, serde=state_serializer())
     saver.setup()
     return saver

@@ -32,7 +32,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 from sqlglot import exp
 
-from gates import SQL_DIALECT, _cte_names, _scope_of, _table_fqn, parse_read_only_sql
+from gates import SQL_DIALECT, _is_cte_ref, _scope_of, _table_fqn, parse_read_only_sql
 from schemas import AuditEvent, Catalog, DataDomain, GateResult, GateStatus
 
 logger = logging.getLogger("platform.auth")
@@ -203,22 +203,29 @@ class TokenVault:
 
     def __init__(self) -> None:
         self._tokens: dict[str, DownstreamToken] = {}
+        self._owners: dict[str, str] = {}
         self._lock = threading.Lock()
 
-    def put(self, token: DownstreamToken) -> str:
+    def put(self, token: DownstreamToken, principal: str) -> str:
         fingerprint = _fingerprint(token.access_token)
         now = datetime.now(UTC)
         with self._lock:
             for key in [k for k, t in self._tokens.items() if t.expires_at <= now]:
                 del self._tokens[key]
+                self._owners.pop(key, None)
             self._tokens[fingerprint] = token
+            self._owners[fingerprint] = principal
         return fingerprint
 
-    def get(self, fingerprint: str) -> DownstreamToken:
+    def get(self, fingerprint: str, principal: str) -> DownstreamToken:
+        """The token for this fingerprint, only for the principal it was issued to."""
         with self._lock:
             token = self._tokens.get(fingerprint)
             if token is not None and token.expires_at <= datetime.now(UTC):
                 del self._tokens[fingerprint]
+                self._owners.pop(fingerprint, None)
+                token = None
+            if token is not None and not hmac.compare_digest(self._owners.get(fingerprint, ""), principal):
                 token = None
         if token is None:
             raise AuthError("No valid warehouse token for this session; sign in again.")
@@ -434,7 +441,7 @@ def authenticate_user(user_jwt: str, idp: IdentityProvider | None = None) -> Aut
         allowed_domains=SNOWFLAKE_ROLE_DOMAINS[role],
         scopes=token.scopes,
         expires_at=min(token.expires_at, user_expiry),
-        token_fingerprint=TOKEN_VAULT.put(token),
+        token_fingerprint=TOKEN_VAULT.put(token, upn),
     )
     logger.info(
         "auth.user_obo.ok provider=%s principal=%s role=%s", idp.name, ctx.principal, ctx.snowflake_role
@@ -473,7 +480,7 @@ def authenticate_service(
         allowed_domains=SNOWFLAKE_ROLE_DOMAINS[sp.execution_role],
         scopes=token.scopes,
         expires_at=token.expires_at,
-        token_fingerprint=TOKEN_VAULT.put(token),
+        token_fingerprint=TOKEN_VAULT.put(token, sp.service_account_id),
         service_account_id=sp.service_account_id,
         airflow_dag_id=airflow_dag_id,
         airflow_dag_run_id=airflow_dag_run_id,
@@ -509,10 +516,9 @@ def load_auth_context(raw: dict[str, Any] | AuthContext | None) -> AuthContext:
 def authorize_sql(sql: str, ctx: AuthContext, catalog: Catalog) -> GateResult:
     """The session role must be entitled to every table's data domain."""
     root = parse_read_only_sql(sql)
-    cte_names = _cte_names(root)
     denied: list[str] = []
     for table in root.find_all(exp.Table):
-        if not table.db and table.name.upper() in cte_names:
+        if _is_cte_ref(table):
             continue
         spec = catalog.get(_table_fqn(table))
         if spec is None:
@@ -542,9 +548,8 @@ def apply_row_level_security(sql: str, ctx: AuthContext, catalog: Catalog) -> st
     if ctx.auth_path is AuthPath.M2M:
         return sql
     root = parse_read_only_sql(sql)
-    cte_names = _cte_names(root)
     for select in root.find_all(exp.Select):
-        for alias, spec in _scope_of(select, catalog, cte_names).items():
+        for alias, spec in _scope_of(select, catalog).items():
             if RLS_COLUMN in spec.columns:
                 select.where(
                     exp.column(RLS_COLUMN, table=alias).eq(exp.CurrentUser()), copy=False

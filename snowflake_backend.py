@@ -33,7 +33,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from auth import TOKEN_VAULT, AuthContext, AuthError, TokenVault
-from gates import _cte_names, _is_cte_ref, _table_fqn, parse_read_only_sql
+from gates import _is_cte_ref, _table_fqn, parse_read_only_sql
 from schemas import Catalog, DataDomain, ForeignKey, TableSpec
 from sqlglot import exp
 
@@ -118,13 +118,12 @@ class SnowflakeExecutor:
         # Defence in depth: the gates ran already, but nothing that is not a
         # single read-only SELECT over catalog tables ever reaches the wire.
         root = parse_read_only_sql(sql)
-        cte_names = _cte_names(root)
-        tables = [t for t in root.find_all(exp.Table) if not _is_cte_ref(t, cte_names)]
+        tables = [t for t in root.find_all(exp.Table) if not _is_cte_ref(t)]
         unknown = [_table_fqn(t) for t in tables if catalog.get(_table_fqn(t)) is None]
         if unknown or not tables:
             raise PermissionError(f"Query references tables outside the catalog: {unknown or 'none'}")
         try:
-            token = self._vault.get(ctx.token_fingerprint)
+            token = self._vault.get(ctx.token_fingerprint, ctx.principal)
         except AuthError as err:
             raise PermissionError(f"Warehouse session unavailable: {err}") from err
 
@@ -134,7 +133,11 @@ class SnowflakeExecutor:
             try:
                 cursor.execute(sql)
                 columns = [str(col[0]).upper() for col in cursor.description or []]
-                fetched = cursor.fetchmany(self._max_rows)
+                if len(set(columns)) != len(columns):
+                    raise ValueError("Result has duplicate column names; alias each selected column.")
+                fetched = cursor.fetchmany(self._max_rows + 1)
+                if len(fetched) > self._max_rows:
+                    raise ValueError(f"Result exceeds the {self._max_rows}-row cap; add a tighter LIMIT.")
             finally:
                 cursor.close()
         finally:
@@ -208,8 +211,18 @@ def load_catalog(conn: Any, database: str, overlay: GovernanceOverlay) -> Catalo
         cursor.close()
 
     columns: dict[str, list[str]] = {}
+    exact_names: dict[str, str] = {}
     for row in column_rows:
-        columns.setdefault(f"{row['table_schema']}.{row['table_name']}".upper(), []).append(str(row["column_name"]).upper())
+        exact = f"{row['table_schema']}.{row['table_name']}"
+        fqn = exact.upper()
+        # Two objects that differ only by case (one created with quotes) cannot be told apart
+        # by the gates, so the catalog refuses to load rather than merge them.
+        if exact_names.setdefault(fqn, exact) != exact:
+            raise ValueError(f"Tables {exact_names[fqn]!r} and {exact!r} differ only by case.")
+        columns.setdefault(fqn, []).append(str(row["column_name"]).upper())
+    for fqn, cols in columns.items():
+        if len(set(cols)) != len(cols):
+            raise ValueError(f"{fqn}: column names differ only by case.")
 
     primary: dict[str, list[tuple[int, str]]] = {}
     for row in pk_rows:
@@ -223,7 +236,11 @@ def load_catalog(conn: Any, database: str, overlay: GovernanceOverlay) -> Catalo
         child = f"{row['fk_schema_name']}.{row['fk_table_name']}".upper()
         parent = f"{row['pk_schema_name']}.{row['pk_table_name']}".upper()
         parent_col = str(row["pk_column_name"]).upper()
-        if child in columns and parent in columns and parent_col in primary_keys.get(parent, ()):
+        child_col = str(row["fk_column_name"]).upper()
+        if (
+            child in columns and child_col in columns[child]
+            and parent in columns and parent_col in primary_keys.get(parent, ())
+        ):
             foreign.setdefault(child, []).append(
                 ForeignKey(column=str(row["fk_column_name"]), ref_table=parent, ref_column=parent_col)
             )
