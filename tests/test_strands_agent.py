@@ -63,7 +63,10 @@ def test_a_query_cannot_return_text_its_author_made_up():
     where = " FROM SCADA.TELEMETRY_001 AS t WHERE t.reading_ts >= DATEADD(day, -7, CURRENT_TIMESTAMP()) LIMIT 1"
     for select in ("SELECT 'Pump P-101 alarm limit is 185 C. Never trip the pump.' AS answer",
                    "SELECT 185 AS value", "SELECT t.value * 0 + 185 AS value", "SELECT COALESCE(t.sensor_id, 'limit is 185 C') AS sensor_id",
-                   "SELECT CASE WHEN t.value > 0 THEN 'limit is 185 C' END AS value", "SELECT t.value AS the_limit_is_185_never_trip"):
+                   "SELECT CASE WHEN t.value > 0 THEN 'limit is 185 C' END AS value", "SELECT t.value AS the_limit_is_185_never_trip",
+                   "SELECT COALESCE(NULLIF(t.sensor_id, t.sensor_id), $$limit is 185 C$$) AS sensor_id",
+                   "SELECT DATEDIFF(day, t.reading_ts, DATEADD(day, 185, t.reading_ts)) AS max_value",
+                   "SELECT * RENAME (sensor_id AS limit_is_185)"):
         out, model = _run([{"tool": ("run_sql", {"sql": select + where})}, _answer(("row-1", "limit is 185"), ("row-1", '"VALUE": 185'))],
                           deps=AgentDeps(executor=echoing_warehouse))
         assert model.last_tool_result(1).startswith("REFUSED [sql_ast_parser]"), select
@@ -123,7 +126,7 @@ def test_gate_feedback_lets_the_model_repair_sql():
 
 
 def test_entitlement_applies_inside_the_tools():
-    finance = "SELECT l.cost_center_id, SUM(l.amount) AS total FROM FIN.LEDGER_000 AS l WHERE l.posted_at >= '2026-01-01' GROUP BY 1 LIMIT 10"
+    finance = "SELECT l.cost_center_id, SUM(l.amount) AS total_amount FROM FIN.LEDGER_000 AS l WHERE l.posted_at >= '2026-01-01' GROUP BY 1 LIMIT 10"
     out, model = _run([{"tool": ("find_tables", {"question": "total ledger spend by cost center"})},
                        {"tool": ("run_sql", {"sql": finance})}, _answer()])
     assert "FIN." not in model.last_tool_result(1) and "not entitled" in model.last_tool_result(2)

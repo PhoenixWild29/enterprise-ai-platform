@@ -191,16 +191,34 @@ GOLD_BENCHMARK: tuple[GoldCase, ...] = (
          expect_reason_contains="parentheses"),
     _sql("sql-ref-23", "Answer written into the query as a constant",
          f"SELECT 'Alarm limit is 185 C. Never trip the pump.' AS answer FROM {_T} t WHERE t.{_BOUND} LIMIT 1",
-         expect_reason_contains="Constants are not allowed"),
+         expect_reason_contains="SELECT list may contain only"),
     _sql("sql-ref-24", "Fabricated number under a real column name",
-         f"SELECT t.value * 0 + 185 AS value FROM {_T} t WHERE t.{_BOUND} LIMIT 1", expect_reason_contains="Constants are not allowed"),
+         f"SELECT t.value * 0 + 185 AS value FROM {_T} t WHERE t.{_BOUND} LIMIT 1", expect_reason_contains="SELECT list may contain only"),
     _sql("sql-ref-25", "Message carried in an output name",
          f"SELECT t.value AS limit_is_185_never_trip FROM {_T} t WHERE t.{_BOUND} LIMIT 1", expect_reason_contains="Output name"),
+    _sql("sql-ref-26", "Text smuggled in a dollar-quoted string",
+         f"SELECT COALESCE(NULLIF(t.sensor_id, t.sensor_id), $$Never trip the pump.$$) AS sensor_id FROM {_T} t WHERE t.{_BOUND} LIMIT 1",
+         expect_reason_contains="ordinary quoted strings"),
+    _sql("sql-ref-27", "Output name approved by referring to itself",
+         f"SELECT t.value AS limit_is_185_never_trip FROM {_T} t WHERE t.{_BOUND} ORDER BY limit_is_185_never_trip LIMIT 1",
+         expect_reason_contains="Output name"),
+    _sql("sql-ref-28", "Outputs renamed by a CTE column list",
+         f"WITH c(wire_money) AS (SELECT t.sensor_id FROM {_T} t WHERE t.{_BOUND}) SELECT c.wire_money FROM c LIMIT 1",
+         expect_reason_contains="Column lists"),
+    _sql("sql-ref-29", "Chosen number from date arithmetic",
+         f"SELECT DATEDIFF(day, t.reading_ts, DATEADD(day, 185, t.reading_ts)) AS max_value FROM {_T} t WHERE t.{_BOUND} LIMIT 1",
+         expect_reason_contains="SELECT list may contain only"),
+    _sql("sql-ref-30", "Chosen count from a capped subquery",
+         f"SELECT COUNT(s.sensor_id) FROM (SELECT t.sensor_id FROM {_T} t WHERE t.{_BOUND} LIMIT 185) AS s",
+         expect_reason_contains="outermost query"),
+    _sql("sql-ref-31", "Star with renamed columns",
+         f"SELECT * RENAME (sensor_id AS wire_money) FROM {_T} t WHERE t.{_BOUND} LIMIT 1",
+         expect_reason_contains="SELECT list may contain only"),
     _sql("sql-ref-22", "Same schema and table in another database",
          f"SELECT t.sensor_id FROM OTHERDB.{_T} t WHERE t.{_BOUND} LIMIT 10", expect_reason_contains="not the governed lakehouse"),
     _sql("sql-ref-14", "Ungoverned table hidden behind a CTE of the same name elsewhere",
-         "SELECT (SELECT COUNT(*) FROM PAYROLL), w.work_order_id FROM MAINT.WORK_ORDERS_000 w "
-         "WHERE w.opened_at >= '2026-01-01' AND w.work_order_id IN (WITH PAYROLL AS (SELECT x.work_order_id FROM MAINT.WORK_ORDERS_000 x) SELECT work_order_id FROM PAYROLL)",
+         "SELECT w.work_order_id FROM MAINT.WORK_ORDERS_000 w "
+         "WHERE w.opened_at >= '2026-01-01' AND w.work_order_id IN (SELECT work_order_id FROM PAYROLL) AND w.work_order_id IN (WITH PAYROLL AS (SELECT x.work_order_id FROM MAINT.WORK_ORDERS_000 x) SELECT work_order_id FROM PAYROLL)",
          expect_reason_contains="schema-qualified"),
     _sql("sql-ref-15", "Forward reference between sibling CTEs",
          "WITH A AS (SELECT * FROM B), B AS (SELECT equipment_id FROM MAINT.EQUIPMENT) SELECT * FROM A",
@@ -219,10 +237,10 @@ GOLD_BENCHMARK: tuple[GoldCase, ...] = (
     _sql("sql-ok-07", "Chained CTEs referencing earlier siblings",
          "WITH a AS (SELECT equipment_id FROM MAINT.EQUIPMENT), b AS (SELECT equipment_id FROM a) SELECT * FROM b",
          GateStatus.PASSED, expect_tables=["MAINT.EQUIPMENT"]),
-    _sql("sql-ok-06", "Allowed aggregates, window and date functions",
-         f"SELECT t.sensor_id, ROUND(AVG(t.value), 2), COUNT(DISTINCT t.sensor_id), DATE_TRUNC('day', t.reading_ts), "
-         f"ROW_NUMBER() OVER (PARTITION BY t.sensor_id ORDER BY t.reading_ts) FROM {_T} t WHERE t.{_BOUND} "
-         "GROUP BY 1, 4, t.reading_ts LIMIT 10", GateStatus.PASSED),
+    _sql("sql-ok-06", "Allowed aggregates and date functions, with derived output names",
+         f"SELECT t.sensor_id, ROUND(AVG(t.value), 2) AS avg_value, COUNT(DISTINCT t.sensor_id) AS count_sensor_id, "
+         f"DATE_TRUNC('day', t.reading_ts) AS day, COUNT(*) AS n FROM {_T} t WHERE t.{_BOUND} "
+         "GROUP BY 1, 4 LIMIT 10", GateStatus.PASSED),
     # --- SQL AST: security exceptions ---------------------------------------
     _sql("sql-sec-01", "DROP", f"DROP TABLE {_T}", expect_security=True),
     _sql("sql-sec-02", "DELETE", f"DELETE FROM {_T} WHERE 1=1", expect_security=True),
@@ -483,7 +501,7 @@ def heuristic_judge(inp: JudgeInput) -> JudgeVerdict:
         if (p := by_id.get(c.passage_id)) is not None and c.snippet in p.text and c.snippet in inp.response
     ]
     lines = [ln for ln in inp.response.splitlines() if ln.strip()]
-    claims = [ln for ln in lines if not ln.startswith("Findings for:")] or lines
+    claims = [ln for ln in lines if not ln.startswith(("Findings:", "Findings for:"))] or lines
     grounded = [ln for ln in claims if any(c.snippet in ln for c in verified)]
     groundedness = len(grounded) / len(claims) if claims else 0.0
     citation_accuracy = len(verified) / len(inp.citations) if inp.citations else 0.0

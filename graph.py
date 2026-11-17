@@ -253,7 +253,7 @@ def extractive_synthesizer(query: str, passages: list[Passage]) -> tuple[str, li
     top = docs[: 2 if rows else 3] + rows[: 2 if docs else 3]
     citations = [Citation.from_passage(p) for p in top]
     lines = [f'- "{c.snippet}" [{c.passage_id}]' for c in citations]
-    draft = f"Findings for: {query}\n" + "\n".join(lines)
+    draft = "Findings:\n" + "\n".join(lines)  # the question is not echoed into a released answer
     return draft, citations
 
 

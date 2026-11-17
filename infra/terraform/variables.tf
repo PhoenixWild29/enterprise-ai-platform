@@ -36,7 +36,7 @@ variable "api_audience" {
 
 variable "allowed_client_ids" {
   type        = list(string)
-  description = "Client applications allowed to call the runtime."
+  description = "Client applications (people's apps and scheduled jobs) allowed to call the platform, matched against the token's azp."
 }
 
 variable "bedrock_model_arns" {
@@ -46,8 +46,12 @@ variable "bedrock_model_arns" {
 
 variable "environment" {
   type        = map(string)
-  default     = {}
-  description = "Extra environment variables for the container (catalog path, Snowflake account, model ids)."
+  description = "Further non-secret settings for the container. Must include the Snowflake account and warehouse."
+
+  validation {
+    condition     = alltrue([for key in ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_WAREHOUSE"] : contains(keys(var.environment), key)])
+    error_message = "environment must set SNOWFLAKE_ACCOUNT and SNOWFLAKE_WAREHOUSE."
+  }
 }
 
 variable "memory_event_expiry_days" {
@@ -105,8 +109,12 @@ variable "catalog_path" {
 
 variable "retriever_backend" {
   type        = string
-  default     = "snowflake"
-  description = "Document retrieval backend."
+  description = "Document retrieval backend. snowflake also needs PASSAGES_TABLE and SNOWFLAKE_CONNECTION_NAME in var.environment; vector and hybrid need CORPUS_PATH."
+
+  validation {
+    condition     = contains(["snowflake", "vector", "hybrid"], var.retriever_backend)
+    error_message = "retriever_backend must be snowflake, vector or hybrid."
+  }
 }
 
 variable "kms_key_arn" {

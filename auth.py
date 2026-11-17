@@ -453,6 +453,8 @@ def authenticate_user(user_jwt: str, idp: IdentityProvider | None = None) -> Aut
     idp = idp or ACTIVE_IDP
     try:
         claims = idp.validate_user_token(user_jwt)
+        if claims.get("idtyp") == "app":
+            raise AuthError("An app-only token cannot be used as a person.")
         upn = claims.get("upn")  # preferred_username is mutable and not safe for authorization
         oid = claims.get("oid")
         if not upn or not oid:

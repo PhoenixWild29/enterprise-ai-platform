@@ -46,8 +46,9 @@ class JobRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    airflow_dag_id: str = Field(min_length=1, max_length=200)
-    airflow_dag_run_id: str = Field(min_length=1, max_length=200)
+    # Identifiers only: these are logged and exported in traces.
+    airflow_dag_id: str = Field(pattern=r"^[A-Za-z0-9_.:+-]{1,200}$")
+    airflow_dag_run_id: str = Field(pattern=r"^[A-Za-z0-9_.:+-]{1,200}$")
 
 
 class Invocation(BaseModel):
@@ -128,8 +129,9 @@ CONFIG_REFUSAL = "[configuration] The service is not available."
 def invoke(payload: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         request = Invocation.model_validate(payload)
-    except ValidationError as err:
-        return _refused("[request] " + "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in err.errors()))
+    except ValidationError:
+        # Fixed wording: validation messages repeat field names the caller chose.
+        return _refused("[request] The request body is not valid. Send a prompt of 1 to 4000 characters and, for a scheduled run, a job with airflow_dag_id and airflow_dag_run_id.")
 
     try:
         services = platform()

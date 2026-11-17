@@ -153,7 +153,11 @@ SQL_RULES = (
     "constant, for example t.reading_ts >= DATEADD(day, -7, CURRENT_TIMESTAMP()).\n"
     "4. JOIN only on the listed primary/foreign key relationships, with an explicit ON clause.\n"
     "5. End with a literal LIMIT of at most 1000.\n"
-    "6. Snowflake SQL dialect. Do not filter on USER_ID; row-level security is applied for you."
+    "6. Snowflake SQL dialect. Do not filter on USER_ID; row-level security is applied for you.\n"
+    "7. The SELECT list may contain only columns, *, COUNT/SUM/AVG/MIN/MAX of a column, ROUND of those and "
+    "DATE_TRUNC of a column: no constants, arithmetic, CASE or other functions. Name an output only as the "
+    "column itself or function_column, for example avg_value, max_value, count_sensor_id; COUNT(*) AS n. "
+    "LIMIT only on the outermost query."
 )
 
 

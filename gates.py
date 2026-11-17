@@ -272,52 +272,100 @@ def _check_expression_policy(root: exp.Expression) -> None:
             raise SQLValidationError(f"Session context value '{name}' is not on the allowed list.")
 
 
-# Functions whose own arguments may be constants in a SELECT list (a rounding
-# precision, a date part, an interval). Everywhere else in a SELECT list a
-# constant is refused.
-_CONSTANT_ARGUMENT_FUNCTIONS: tuple[type[exp.Expression], ...] = tuple(
-    getattr(exp, name)
-    for name in ("Round", "DateTrunc", "TimestampTrunc", "DateAdd", "DateSub", "DateDiff", "TimestampAdd",
-                 "TimestampSub", "TimestampDiff", "TsOrDsAdd", "Extract", "Interval", "TimeSlice")
-    if hasattr(exp, name)
+# ---------------------------------------------------------------------------
+# Projection policy: what a query may return
+# ---------------------------------------------------------------------------
+# Result rows are released to the user as evidence. A SELECT list is therefore
+# an allow-list of shapes, not a deny-list of bad ones: a column, a star, one
+# of five aggregates over a column, ROUND of either, or DATE_TRUNC of a column.
+# Output names are derived from those shapes; an author cannot choose one.
+
+_AGGREGATES: dict[type[exp.Expression], tuple[str, ...]] = {
+    exp.Count: ("count",), exp.Sum: ("sum", "total"), exp.Avg: ("avg", "average", "mean"),
+    exp.Min: ("min",), exp.Max: ("max",),
+}
+_COUNT_STAR_NAMES = frozenset({"n", "count", "row_count", "total_rows"})
+_DATE_PARTS = frozenset({"year", "quarter", "month", "week", "day", "hour", "minute"})
+_TRUNC_TYPES: tuple[type[exp.Expression], ...] = tuple(
+    t for n in ("TimestampTrunc", "DateTrunc") if isinstance(t := getattr(exp, n, None), type)
 )
-_ALIAS_WORDS = frozenset(
-    "total avg average min max sum count cnt n num number first last latest earliest mean median stddev distinct "
-    "daily hourly weekly monthly day hour week month year date bucket per by of rows".split()
+_UNUSUAL_STRINGS: tuple[type[exp.Expression], ...] = tuple(
+    t for n in ("RawString", "HexString", "BitString", "ByteString", "National", "UnicodeString")
+    if isinstance(t := getattr(exp, n, None), type)
 )
-MAX_ALIAS_CHARS = 40
+MAX_ROUND_DECIMALS = 6
+_PROJECTION_RULE = (
+    "A SELECT list may contain only columns, *, COUNT/SUM/AVG/MIN/MAX of a column, ROUND of those, "
+    "and DATE_TRUNC of a column."
+)
+
+
+def _plain_column(node: exp.Expression | None) -> str | None:
+    """The lower-case name of a plain column reference, else None."""
+    if isinstance(node, exp.Column) and isinstance(node.this, exp.Identifier):
+        return node.name.lower()
+    return None
+
+
+def _projection_names(value: exp.Expression) -> frozenset[str] | None:
+    """Output names an allowed SELECT-list expression may carry (empty: it may
+    not be renamed). None when the expression is not an allowed shape."""
+    if isinstance(value, exp.Star) or (isinstance(value, exp.Column) and isinstance(value.this, exp.Star)):
+        star = value if isinstance(value, exp.Star) else value.this
+        modifiers = [k for k, v in star.args.items() if v]
+        return None if modifiers else frozenset()  # no EXCLUDE / REPLACE / RENAME
+    if (column := _plain_column(value)) is not None:
+        return frozenset({column})
+    if isinstance(value, exp.Round):
+        decimals = value.args.get("decimals")
+        if decimals is not None and not (
+            isinstance(decimals, exp.Literal) and decimals.is_int and 0 <= int(decimals.this) <= MAX_ROUND_DECIMALS
+        ):
+            return None
+        inner = value.this
+        if isinstance(inner, exp.Round) or isinstance(inner, _TRUNC_TYPES):
+            return None
+        return _projection_names(inner)
+    if type(value) in _AGGREGATES:
+        prefixes, target = _AGGREGATES[type(value)], value.this
+        if isinstance(value, exp.Count) and isinstance(target, exp.Star):
+            return _COUNT_STAR_NAMES
+        if isinstance(value, exp.Count) and isinstance(target, exp.Distinct) and len(target.expressions) == 1:
+            target = target.expressions[0]
+        column = _plain_column(target)
+        if column is None:
+            return None
+        return frozenset({f"{p}_{column}" for p in prefixes} | {f"{column}_{p}" for p in prefixes})
+    if isinstance(value, _TRUNC_TYPES):
+        column, unit = _plain_column(value.this), value.args.get("unit")
+        part = unit.name.lower() if isinstance(unit, (exp.Var, exp.Literal)) else ""
+        if column is None or part not in _DATE_PARTS:
+            return None
+        return frozenset({part, column, f"{part}_{column}", f"{column}_{part}"})
+    return None
 
 
 def _check_projection_policy(root: exp.Expression) -> None:
-    """Every value a query returns must come from table data.
-
-    Result rows are released to the user as evidence, so a query must not be
-    able to return text or numbers its author made up: no constants in a
-    SELECT list (outside a date part or rounding precision), every selected
-    expression must read a column, and an output name is built only from
-    column names in the query and a fixed set of aggregate words."""
-    column_words = {word for column in root.find_all(exp.Column) for word in column.name.lower().split("_") if word}
+    """Every value a query returns must be table data under a name the
+    author did not choose. Applies to every SELECT in the statement, so a
+    CTE or subquery cannot be used to manufacture a value or a name."""
+    for node in root.find_all(*_UNUSUAL_STRINGS):
+        raise SQLValidationError("Only ordinary quoted strings are allowed.")
+    for alias in root.find_all(exp.TableAlias):
+        if alias.args.get("columns"):
+            raise SQLValidationError("Column lists on a CTE or subquery are not allowed; they rename outputs.")
     for select in root.find_all(exp.Select):
+        if select is not root and select.args.get("limit") is not None:
+            # A row cap inside a subquery lets its author pick what an outer COUNT returns.
+            raise SQLValidationError("LIMIT is only allowed on the outermost query.")
         for projection in select.expressions:
-            value = projection.unalias()
-            for constant in projection.find_all(exp.Literal, exp.Boolean, exp.Null):
-                holder = constant.parent
-                while isinstance(holder, (exp.Paren, exp.Neg)):
-                    holder = holder.parent
-                if not isinstance(holder, _CONSTANT_ARGUMENT_FUNCTIONS):
-                    raise SQLValidationError(
-                        "Constants are not allowed in the SELECT list; select columns and aggregates of columns only."
-                    )
-            if not isinstance(value, exp.Star) and value.find(exp.Column, exp.Star) is None:
-                raise SQLValidationError("Every selected expression must read a table column.")
-            alias = projection.alias if isinstance(projection, exp.Alias) else ""
-            if alias:
-                words = [word for word in alias.lower().split("_") if word]
-                if len(alias) > MAX_ALIAS_CHARS or not all(w in _ALIAS_WORDS or w in column_words for w in words):
-                    raise SQLValidationError(
-                        f"Output name '{alias[:MAX_ALIAS_CHARS]}' is not allowed; name outputs after the columns they come "
-                        "from, with words such as total, avg, min, max or count."
-                    )
+            names = _projection_names(projection.unalias())
+            if names is None:
+                raise SQLValidationError(_PROJECTION_RULE)
+            alias = projection.alias.lower() if isinstance(projection, exp.Alias) else ""
+            if alias and alias not in names:
+                allowed = ", ".join(sorted(names)[:4]) or "no alias"
+                raise SQLValidationError(f"Output name '{alias[:40]}' is not allowed here; use one of: {allowed}.")
 
 
 def parse_read_only_sql(sql: str) -> exp.Expression:

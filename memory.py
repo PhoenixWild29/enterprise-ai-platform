@@ -47,6 +47,7 @@ MAX_MEMORY_CHARS = 500
 # bound and every entry is more text carried into every later prompt.
 MAX_ENTRIES_PER_OWNER = {"session": 20, "user": 50}
 MAX_PENDING_PER_AUTHOR = 20
+MAX_EVENTS_LOADED = 1000
 REVIEWER_SNOWFLAKE_ROLE = "PLATFORM_ADMIN"
 
 
@@ -108,10 +109,11 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _INSTRUCTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\b(?:ignore|disregard|forget|override)\b.{0,40}\b(?:previous|prior|above|earlier|all|any|system|safety|rules?|instructions?|polic(?:y|ies)|gates?)\b"),
-    re.compile(r"(?i)\b(?:you are now|you (?:must|should|will|shall|need to|have to)|(?:you|please|to) act as|pretend to be|from now on|new instructions?|system prompt|developer message)\b"),
-    re.compile(r"(?i)\b(?:always|never)\b.{0,60}\b(?:approve|refuse|cite|citation|filter|row-level|security|authoriz|permission|entitle)"),
+    re.compile(r"(?i)\b(?:you are now|(?:you|please|to) act as|pretend to be|from now on|new instructions?|system prompt|developer message)\b"),
+    re.compile(r"(?i)\byou (?:must|should|will|shall|need to|have to)\b.{0,40}\b(?:treat|approve|ignore|always|never|grant|allow|skip|obey|follow|comply)\b"),
+    re.compile(r"(?i)\b(?:always|never)\b.{0,60}\b(?:approve|refuse|row-level|security|authoriz|permission|entitle)"),
     re.compile(r"(?i)\b(?:pre-?approved?|auto-?approve|without (?:review|approval|checking|citations?))\b"),
-    re.compile(r"(?i)\b(?:do not|don't|never|skip|bypass|disable)\b.{0,40}\b(?:checks?|verify|validat\w*|gates?|review|cit(?:e|ation)s?|row limits?|filters?)\b"),
+    re.compile(r"(?i)\b(?:do not|don't|never|skip|bypass|disable)\b.{0,40}\b(?:checks?|verif\w*|validat\w*|gates?|citations?|row limits?|filters?|security)\b"),
     re.compile(r"(?i)</?\s*(?:system|assistant|user|instructions?|memory|tool)[^>]*>"),
 )
 _EVIDENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -132,7 +134,8 @@ class MemoryPolicy:
         if not cleaned:
             raise MemoryRefused("Empty memory.")
         if any(_mixes_scripts(word) for word in cleaned.split()):
-            # A word spelled with letters from two alphabets is how a look-alike slips past a pattern.
+            # A word spelled with letters from two alphabets (Latin and Cyrillic, say) is how a
+            # look-alike slips past a pattern. Accented Latin letters are one alphabet and are fine.
             raise MemoryRefused("Memory reads as an instruction to the agent; words that mix alphabets are not stored.")
         if len(cleaned) > MAX_MEMORY_CHARS:
             raise MemoryRefused(f"Memory is longer than {MAX_MEMORY_CHARS} characters.")
@@ -261,23 +264,26 @@ class AgentCoreMemoryStore(InMemoryStore):
         validates, passes today's policy, belongs to this user, and does not
         reuse the id of an entry that is not theirs."""
         policy, now = MemoryPolicy(), datetime.now(UTC)
-        events = self._client.list_events(memory_id=self._memory_id, actor_id=_actor_id(principal), session_id=USER_PROFILE_SESSION)
+        events = self._client.list_events(
+            memory_id=self._memory_id, actor_id=_actor_id(principal), session_id=USER_PROFILE_SESSION,
+            max_results=MAX_EVENTS_LOADED,  # enough for every live entry and its tombstones; compact before this is reached
+        )
         candidates: dict[str, MemoryRecord] = {}
         forgotten: set[str] = set()
         for event in events:
-            for item in event.get("payload", []):
-                text = (item.get("conversational") or {}).get("content", {}).get("text")
-                if not text:
-                    continue
+            for item in event.get("payload", []) if isinstance(event, dict) else []:
                 try:
+                    text = item["conversational"]["content"]["text"]
                     raw = json.loads(text)
                     if isinstance(raw, dict) and set(raw) == {"forget"}:
                         forgotten.add(str(raw["forget"]))
                         continue
                     record = MemoryRecord.model_validate(raw)
                     cleaned = policy.check_text(record.text)
-                except ValueError:
-                    continue
+                    if record.created_at.tzinfo is None or record.expires_at.tzinfo is None:
+                        raise ValueError("timestamps must carry a time zone")
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue  # a malformed event is skipped; it never stops the rest from loading
                 if record.scope is not MemoryScope.USER or record.owner != principal:
                     continue
                 created = min(record.created_at, now)
@@ -306,8 +312,9 @@ USER_PROFILE_SESSION = "user-profile"
 
 
 def _mixes_scripts(word: str) -> bool:
-    letters = [ch for ch in word if ch.isalpha()]
-    return any(ch.isascii() for ch in letters) and any(not ch.isascii() for ch in letters)
+    """True when one word uses letters from more than one script."""
+    scripts = {unicodedata.name(ch, "UNKNOWN").split(" ")[0] for ch in word if ch.isalpha()}
+    return len(scripts) > 1
 
 
 def _actor_id(principal: str) -> str:

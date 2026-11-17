@@ -104,6 +104,15 @@ data "aws_iam_policy_document" "execution" {
     resources = var.credential_secret_arns
   }
 
+  dynamic "statement" {
+    for_each = var.kms_key_arn == null ? [] : [var.kms_key_arn]
+    content {
+      sid       = "DecryptImage"
+      actions   = ["kms:Decrypt"]
+      resources = [statement.value]
+    }
+  }
+
   # Memory is append-only from the agent: forgetting an entry writes a tombstone event.
   statement {
     sid       = "AgentMemory"
@@ -140,7 +149,8 @@ resource "aws_bedrockagentcore_agent_runtime" "agent" {
   }
 
   # Private networking: the runtime reaches Bedrock, Snowflake and ECR through the VPC.
-  # It also needs HTTPS egress to login.microsoftonline.com to fetch Entra signing keys.
+  # That means VPC endpoints (or NAT) for Bedrock, AgentCore, ECR and CloudWatch Logs, a route
+  # to Snowflake, and HTTPS egress to login.microsoftonline.com for Entra signing keys.
   network_configuration {
     network_mode = "VPC"
 
@@ -159,7 +169,9 @@ resource "aws_bedrockagentcore_agent_runtime" "agent" {
     custom_jwt_authorizer {
       discovery_url    = "https://login.microsoftonline.com/${var.entra_tenant_id}/v2.0/.well-known/openid-configuration"
       allowed_audience = [var.api_audience]
-      allowed_clients  = var.allowed_client_ids
+      # allowed_clients is left out on purpose: it has not been confirmed which claim the
+      # runtime matches it against, and Entra v2 tokens carry the client in azp. The
+      # application enforces the client allow-list itself (ENTRA_ALLOWED_CLIENT_IDS).
     }
   }
 
@@ -183,6 +195,7 @@ resource "aws_bedrockagentcore_agent_runtime" "agent" {
       ENTRA_TENANT_ID         = var.entra_tenant_id
       ENTRA_CLIENT_ID         = var.entra_client_id
       ENTRA_API_AUDIENCE      = var.api_audience
+      ENTRA_ALLOWED_CLIENT_IDS = join(",", var.allowed_client_ids)
       SNOWFLAKE_SCOPE_PREFIX  = var.snowflake_scope_prefix
       AGENTCORE_OBO_PROVIDER  = var.obo_credential_provider_name
       AGENTCORE_M2M_PROVIDER  = var.m2m_credential_provider_name
