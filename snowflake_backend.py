@@ -33,7 +33,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from auth import TOKEN_VAULT, AuthContext, AuthError, TokenVault
-from gates import _is_cte_ref, _table_fqn, parse_read_only_sql
+from gates import SQL_DIALECT, _is_cte_ref, _table_fqn, parse_read_only_sql, resolve_table
 from schemas import Catalog, DataDomain, ForeignKey, TableSpec
 from sqlglot import exp
 
@@ -119,7 +119,7 @@ class SnowflakeExecutor:
         # single read-only SELECT over catalog tables ever reaches the wire.
         root = parse_read_only_sql(sql)
         tables = [t for t in root.find_all(exp.Table) if not _is_cte_ref(t)]
-        unknown = [_table_fqn(t) for t in tables if catalog.get(_table_fqn(t)) is None]
+        unknown = [_table_fqn(t) for t in tables if resolve_table(t, catalog) is None]
         if unknown or not tables:
             raise PermissionError(f"Query references tables outside the catalog: {unknown or 'none'}")
         try:
@@ -127,6 +127,8 @@ class SnowflakeExecutor:
         except AuthError as err:
             raise PermissionError(f"Warehouse session unavailable: {err}") from err
 
+        # Send the statement as re-serialised from the validated AST, never the caller's raw string.
+        sql = root.sql(dialect=SQL_DIALECT, comments=False)
         conn = self._connect(ctx, token.access_token)
         try:
             cursor = conn.cursor()

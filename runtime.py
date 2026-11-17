@@ -85,7 +85,8 @@ def load_catalog(config: RuntimeConfig) -> Catalog:
 def catalog_problems(config: RuntimeConfig, catalog: Catalog) -> list[str]:
     """Catalog checks a production process must pass."""
     problems: list[str] = []
-    if catalog.tables.keys() == DEFAULT_CATALOG.tables.keys():
+    demo = DEFAULT_CATALOG.tables.keys()
+    if len(catalog.tables.keys() & demo) > len(demo) // 2:
         problems.append("a catalog exported from your lakehouse (CATALOG_PATH holds the demo catalog)")
     if config.warehouse_backend == "snowflake":
         database = os.environ.get("SNOWFLAKE_DATABASE", "LAKEHOUSE").upper()

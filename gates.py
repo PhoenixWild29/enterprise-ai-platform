@@ -299,7 +299,10 @@ def parse_read_only_sql(sql: str) -> exp.Expression:
     if len(statements) > 1:
         raise SQLSecurityError(f"Statement stacking detected ({len(statements)} statements).")
 
-    root = statements[0].unnest()
+    root = statements[0]
+    if isinstance(root, exp.Subquery):
+        # Clauses attached outside the parentheses (ORDER BY, OFFSET) would escape every check.
+        raise SQLValidationError("Remove the parentheses around the whole query.")
     if not isinstance(root, _QUERY_ROOTS):
         raise SQLSecurityError(
             f"Root statement is {type(root).__name__}; only SELECT is permitted."
@@ -315,6 +318,14 @@ def _table_fqn(table: exp.Table) -> str:
     return f"{table.db}.{table.name}".upper() if table.db else table.name.upper()
 
 
+def resolve_table(table: exp.Table, catalog: Catalog) -> TableSpec | None:
+    """The catalog entry a table reference names, or None. A reference to
+    another database is never a catalog table, whatever its schema and name."""
+    if table.catalog and table.catalog.upper() != catalog.database.upper():
+        return None
+    return catalog.get(_table_fqn(table)) if table.db else None
+
+
 def _with_of(node: exp.Expression) -> exp.With | None:
     found = node.args.get("with_") or node.args.get("with")
     return found if isinstance(found, exp.With) else None
@@ -325,8 +336,8 @@ def _is_cte_ref(table: exp.Table) -> bool:
     actually in scope at that point: defined by a WITH on an enclosing query,
     or, inside a CTE body, by an earlier sibling in the same WITH. A CTE
     defined in some other branch of the statement does not make the name a CTE."""
-    if table.db or table.catalog:
-        return False
+    if table.args.get("db") is not None or table.args.get("catalog") is not None:
+        return False  # any qualifier, even an empty one (".NAME"), means it is not a CTE reference
     name = table.name.upper()
 
     def defines(ctes: list[exp.Expression]) -> bool:
@@ -371,7 +382,7 @@ def _scope_of(select: exp.Select, catalog: Catalog) -> Scope:
     for table in select.find_all(exp.Table):
         if table.find_ancestor(exp.Select) is not select or _is_cte_ref(table):
             continue
-        if spec := catalog.get(_table_fqn(table)):
+        if spec := resolve_table(table, catalog):
             scope[table.alias_or_name.upper()] = spec
     return scope
 
@@ -609,7 +620,7 @@ def payload_safety_gate(
                 spec.fqn
                 for t in root.find_all(exp.Table)
                 if not _is_cte_ref(t)
-                and (spec := catalog.get(_table_fqn(t))) is not None
+                and (spec := resolve_table(t, catalog)) is not None
                 and spec.is_sensor
             }
         )

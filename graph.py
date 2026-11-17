@@ -48,6 +48,7 @@ from gates import (
     citation_gate_node,
     parse_read_only_sql,
     payload_safety_gate_node,
+    resolve_table,
     sql_ast_gate_node,
     thin_set_gate_node,
 )
@@ -221,7 +222,7 @@ def simulated_executor(sql: str, ctx: AuthContext, catalog: Catalog) -> list[dic
     mirroring what Row-Level Security would return."""
     root = parse_read_only_sql(sql)
     spec = next(
-        (s for t in root.find_all(exp.Table) if (s := catalog.get(_table_fqn(t))) is not None),
+        (s for t in root.find_all(exp.Table) if (s := resolve_table(t, catalog)) is not None),
         None,
     )
     if spec is None:

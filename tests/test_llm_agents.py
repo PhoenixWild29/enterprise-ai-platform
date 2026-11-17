@@ -87,7 +87,7 @@ def test_extractive_synthesizer_releases_only_source_text():
                                           {"passage_id": "p2", "quote": P[1].text}]}))
     draft, cites = LLMSynthesizer(llm)("alarm limit?", P)
     assert _gate(draft, cites).passed
-    assert "alarm limit is 85 C" in cites[0].snippet and len(cites[0].snippet) >= 40 and cites[0].snippet in P[0].text
+    assert cites[0].snippet == P[0].text and cites[1].snippet == P[1].text
     released = [line[3:line.rindex('" [')] for line in draft.splitlines()[1:]]
     assert released == [c.snippet for c in cites] and all(any(r in p.text for p in P) for r in released)
 
@@ -123,24 +123,28 @@ def test_abstractive_claims_need_literal_consistency_and_verifier_approval():
         assert "<claim>The alarm limit is 85 C.</claim>" in llm.prompts[1]
 
 
-def test_extractive_spans_snap_to_whole_sentences():
-    doc = Passage(passage_id="d", source="sop://c", score=0.9,
-                  text="Never bypass the interlock while the compressor is running under load. Relief valve opens at "
-                       "1250 kPa for compressor C-200. Speed limit is 1500 rpm.")
+def test_extractive_release_is_the_whole_passage_never_a_cut():
+    passages = [
+        Passage(passage_id="neg", source="s", score=0.9, text="Do not, under any circumstances e.g. during startup, exceed 1500 kPa on the discharge line while the bypass valve is closed."),
+        Passage(passage_id="wrap", source="s", score=0.9, text="It is not\npermitted to run the pump above 1500 kPa at any time."),
+        Passage(passage_id="exc", source="s", score=0.9, text="Torque the flange bolts to 50 Nm approx. unless the flange is cast iron, in which case do not exceed 30 Nm."),
+        Passage(passage_id="row", source="snowflake://X", score=1.0, text='{"setpoint_status": "SUPERSEDED-DO-NOT-USE", "max_discharge_kpa": 1500, "unit": "P-101"}'),
+        Passage(passage_id="num", source="s", score=0.9, text="Relief valve opens at 1250 kPa for compressor C-200. Speed limit is 1500 rpm."),
+    ]
+    quotes = {"neg": "exceed 1500 kPa on the discharge line", "wrap": "permitted to run the pump above 1500 kPa",
+              "exc": "Torque the flange bolts to 50 Nm", "row": '"max_discharge_kpa": 1500', "num": "250 kPa for compressor C-200"}
+    reply = json.dumps({"evidence": [{"passage_id": k, "quote": v} for k, v in quotes.items()]})
+    draft, cites = LLMSynthesizer(Script(reply))("q", passages)
+    assert verbatim_citation_gate(draft, cites, passages).passed
+    assert [c.snippet for c in cites] == [p.text.strip() for p in passages]  # every release is a complete passage
 
-    def span(quote):
-        draft, cites = LLMSynthesizer(Script(json.dumps({"evidence": [{"passage_id": "d", "quote": quote}]})))("q", [doc])
-        assert verbatim_citation_gate(draft, cites, [doc]).passed
-        return cites[0].snippet
-
-    assert span("bypass the interlock while the compressor is running under load.").startswith("Never bypass")
-    assert "1250 kPa" in span("250 kPa for compressor C-200")
-    assert span("Speed limit is 150").endswith("1500 rpm.")
+    # A passage too long to release whole is not released at all.
+    long_doc = Passage(passage_id="L", source="s", score=0.9, text="Do not exceed 1500 kPa " + "under these conditions " * 80)
+    reply = json.dumps({"evidence": [{"passage_id": "L", "quote": "exceed 1500 kPa"}]})
+    assert LLMSynthesizer(Script(reply))("q", [long_doc]) == ("", [])
     # Over-length model output is dropped, not cut to fit.
-    assert LLMSynthesizer(Script(json.dumps({"evidence": [{"passage_id": "d", "quote": doc.text + " " + "x" * 600}]})))("q", [doc]) == ("", [])
-    long_doc = Passage(passage_id="L", source="s", score=0.9, text="Limit is 1500 rpm " + "and so on " * 80 + "end")
-    draft, cites = LLMSynthesizer(Script(json.dumps({"evidence": [{"passage_id": "L", "quote": "imit is 150"}]})))("q", [long_doc])
-    assert cites == [] or "1500" in cites[0].snippet  # a too-long sentence falls back to whole tokens or nothing
+    reply = json.dumps({"evidence": [{"passage_id": "num", "quote": "x" * 2000}]})
+    assert LLMSynthesizer(Script(reply))("q", passages) == ("", [])
 
 
 def test_abstractive_literal_check_uses_whole_tokens_and_refuses_markup():

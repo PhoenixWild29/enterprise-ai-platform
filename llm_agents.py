@@ -8,8 +8,9 @@ what executes and what is released. Design rules:
     its own draft against the gates, and gets a bounded number of repairs.
     A security violation is never repaired; it goes straight to the gate.
   * The synthesizer is extractive by default: the model only chooses which
-    passages and which verbatim spans answer the question, and the released
-    text is made of those spans. No model-written sentence reaches the user.
+    retrieved passages answer the question, and the released text is those
+    passages, whole. No model-written sentence reaches the user and no
+    passage is cut.
   * Abstractive synthesis (model-written claims) is opt-in. Every claim must
     then pass a deterministic check (its numbers and links must come from the
     cited passage) and an entailment check by a verifier model. A claim that
@@ -232,7 +233,7 @@ class LLMSQLGenerator:
 
 SNIPPET_CHARS = 40
 MAX_EVIDENCE_ITEMS = 5
-MAX_SPAN_CHARS = 600
+MAX_SPAN_CHARS = 1200
 UNVERIFIED_MARK = "[unverified]"
 
 type ClaimVerifier = Callable[[str, Passage], bool]
@@ -280,8 +281,8 @@ def llm_claim_verifier(complete: Completion) -> ClaimVerifier:
 class LLMSynthesizer:
     """Builds the answer from retrieved evidence.
 
-    extractive (default): the model returns passage ids and verbatim quotes;
-        the released text consists of those quotes only.
+    extractive (default): the model returns passage ids with a verbatim quote
+        as proof of relevance; the released text is each chosen passage, whole.
     abstractive: the model writes claims; each must pass
         `claim_is_literally_consistent` and the verifier before release.
     """
@@ -324,35 +325,14 @@ class LLMSynthesizer:
 
     @staticmethod
     def _extract_span(quote: str, passage: Passage) -> str | None:
-        """Widen a verbatim quote to whole sentences of the passage, so a span
-        can never start or stop inside a number or drop the word that negates
-        it. Falls back to whole whitespace-delimited tokens when the sentences
-        are too long. Returns None when the quote is not verbatim or no
-        acceptable span exists."""
-        text = passage.text
-        start = text.find(quote)
-        if start < 0:
+        """The text released for a verbatim quote: the whole passage it came
+        from. Releasing any sub-span lets a cut drop a negation, a condition
+        or half a number, so there are no sub-spans. Passages too long to
+        release whole are not released; chunk the corpus smaller instead."""
+        text = passage.text.strip()
+        if quote not in passage.text or not text or len(text) > MAX_SPAN_CHARS:
             return None
-        end = start + len(quote)
-        required = min(SNIPPET_CHARS, len(text))
-
-        sentence_start = max((text.rfind(mark, 0, start) for mark in (". ", "! ", "? ", "\n")), default=-1)
-        sentence_start = 0 if sentence_start < 0 else sentence_start + (1 if text[sentence_start] == "\n" else 2)
-        stops = [i + 1 for mark in (". ", "! ", "? ") if (i := text.find(mark, max(end - 1, 0))) >= 0]
-        newline = text.find("\n", end)
-        sentence_end = min(stops + ([newline] if newline >= 0 else []), default=len(text))
-        span = text[sentence_start:sentence_end].strip()
-        if len(span) < required:  # a very short sentence: take the whole passage if it is small
-            span = text.strip()
-        if len(span) <= MAX_SPAN_CHARS:
-            return span if len(span) >= required else None
-
-        # Sentences too long to release whole: snap the quote itself to token boundaries.
-        token_start = text.rfind(" ", 0, start) + 1
-        token_end = text.find(" ", end)
-        token_end = len(text) if token_end < 0 else token_end
-        span = text[token_start:token_end]
-        return span if required <= len(span) <= MAX_SPAN_CHARS else None
+        return text
 
     def __call__(self, query: str, passages: list[Passage]) -> tuple[str, list[Citation]]:
         try:
@@ -374,7 +354,7 @@ class LLMSynthesizer:
             if not passage_id or not raw:
                 continue
             if len(raw) > MAX_SPAN_CHARS:
-                continue  # over-length items are dropped whole, never cut to fit
+                continue  # over-length items are dropped, never cut to fit
             passage = by_id.get(passage_id)
             if self._mode == "extractive":
                 body = html.unescape(raw)
@@ -385,7 +365,7 @@ class LLMSynthesizer:
                 else:
                     span = self._extract_span(body, passage)
                     if span is None:
-                        continue  # verbatim but no releasable whole-sentence span
+                        continue  # passage too long to release whole
                     snippet = span
                 lines.append(f'- "{snippet}" [{passage_id}]')
             else:

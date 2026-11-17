@@ -72,7 +72,7 @@ def test_executor_runs_with_the_callers_own_token_and_closes_everything():
     rows = SnowflakeExecutor(factory)(SQL, ctx, DEFAULT_CATALOG)
     role, token = seen[0]
     assert role == "OPS_ANALYST" and token == TOKEN_VAULT.get(ctx.token_fingerprint, ctx.principal).access_token and token.count(".") == 2
-    assert conn.executed == [(SQL, None)] and conn.closed and conn.cursors[0].closed
+    assert conn.executed[0][0].replace(" ", "").upper() == SQL.replace(" ", "").upper() and conn.closed and conn.cursors[0].closed
     assert rows == [
         {"_table": "SCADA.TELEMETRY_001", "SENSOR_ID": "s-1", "READING_TS": "2026-11-16T08:00:00+00:00", "VALUE": 71.5},
         {"_table": "SCADA.TELEMETRY_001", "SENSOR_ID": "s-2", "READING_TS": "2026-11-15T08:00:00+00:00", "VALUE": 77},
@@ -126,6 +126,37 @@ def test_a_token_is_only_usable_by_the_principal_it_was_issued_to():
     with pytest.raises(PermissionError, match="session unavailable"):
         SnowflakeExecutor(lambda c, t: calls.append(1) or FakeConn([TELEMETRY]))(SQL, forged, DEFAULT_CATALOG)
     assert calls == []
+
+
+def test_parenthesised_root_and_foreign_database_never_reach_the_warehouse():
+    from auth import TELEMETRY_SP_CLIENT_ID, TELEMETRY_SP_SECRET, authenticate_service, authorize_sql
+
+    svc = authenticate_service(TELEMETRY_SP_CLIENT_ID, TELEMETRY_SP_SECRET, "nightly_telemetry_rollup", "r1", idp=IDP)
+    conns = []
+
+    def factory(c, token):
+        conns.append(FakeConn([TELEMETRY]))
+        return conns[-1]
+
+    graph = build_graph(AgentDeps(executor=SnowflakeExecutor(factory)))
+    wrapped = ("(SELECT t.sensor_id FROM SCADA.TELEMETRY_001 t WHERE t.reading_ts >= '2026-01-01' LIMIT 10) "
+               "ORDER BY (SELECT MAX(salary) FROM HR.PAYROLL)")
+    other_db = ("SELECT t.sensor_id FROM SCADA.TELEMETRY_001 t WHERE t.reading_ts >= '2026-01-01' AND t.equipment_id IN "
+                "(SELECT equipment_id FROM OTHERDB.SCADA.TELEMETRY_001 WHERE reading_ts >= '2026-01-01') LIMIT 10")
+    empty_schema = "WITH PAYROLL AS (SELECT sensor_id FROM SCADA.TELEMETRY_001 WHERE reading_ts >= '2026-01-01') SELECT * FROM ..PAYROLL LIMIT 5"
+    for sql in (wrapped, other_db, empty_schema):
+        for ctx in (svc, _operator()):
+            assert run_query(f"sql: {sql}", ctx, graph)["gate_status"] == "REFUSED", sql
+    assert conns == []
+    admin = authenticate_user(IDP.issue_user_token("lee.admin@contoso.com", "oid-9", ["Lakehouse.Admin"]), idp=IDP)
+    assert not authorize_sql(other_db, admin, DEFAULT_CATALOG).passed
+    with pytest.raises(PermissionError, match="outside the catalog"):
+        SnowflakeExecutor(factory)(other_db, admin, DEFAULT_CATALOG)
+
+    # What executes is the statement re-serialised from the validated AST, on the service path too.
+    out = run_query("sql: SELECT   t.sensor_id FROM SCADA.TELEMETRY_001 t WHERE t.reading_ts >= '2026-01-01' LIMIT 10 -- ; DROP TABLE x", svc, graph)
+    assert out["gate_status"] == "PASSED"
+    assert conns[0].executed[0][0] == "SELECT t.sensor_id FROM SCADA.TELEMETRY_001 AS t WHERE t.reading_ts >= '2026-01-01' LIMIT 10"
 
 
 def test_executor_does_not_trust_a_cte_name_defined_elsewhere():

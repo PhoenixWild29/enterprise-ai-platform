@@ -32,7 +32,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 from sqlglot import exp
 
-from gates import SQL_DIALECT, _is_cte_ref, _scope_of, _table_fqn, parse_read_only_sql
+from gates import SQL_DIALECT, _is_cte_ref, _scope_of, _table_fqn, parse_read_only_sql, resolve_table
 from schemas import AuditEvent, Catalog, DataDomain, GateResult, GateStatus
 
 logger = logging.getLogger("platform.auth")
@@ -520,7 +520,7 @@ def authorize_sql(sql: str, ctx: AuthContext, catalog: Catalog) -> GateResult:
     for table in root.find_all(exp.Table):
         if _is_cte_ref(table):
             continue
-        spec = catalog.get(_table_fqn(table))
+        spec = resolve_table(table, catalog)
         if spec is None:
             denied.append(f"Table '{_table_fqn(table)}' is not in the catalog.")
         elif spec.domain not in ctx.allowed_domains:
@@ -543,15 +543,20 @@ def apply_row_level_security(sql: str, ctx: AuthContext, catalog: Catalog) -> st
     is enforced by the warehouse because the session is opened with the OBO
     token. The rewrite here makes the same guarantee visible and testable in
     the simulation. Service principals are constrained by their scoped
-    execution role instead, so their SQL is returned unchanged.
+    execution role instead, so no predicate is added for them.
+
+    On both paths the returned SQL is generated from the parsed, validated
+    AST, so what executes is exactly what the gates inspected.
     """
-    if ctx.auth_path is AuthPath.M2M:
-        return sql
     root = parse_read_only_sql(sql)
+    if ctx.auth_path is AuthPath.M2M:
+        # No predicate is added, but the warehouse still receives the SQL as re-serialised
+        # from the validated AST, never the model's raw string.
+        return root.sql(dialect=SQL_DIALECT, comments=False)
     for select in root.find_all(exp.Select):
         for alias, spec in _scope_of(select, catalog).items():
             if RLS_COLUMN in spec.columns:
                 select.where(
                     exp.column(RLS_COLUMN, table=alias).eq(exp.CurrentUser()), copy=False
                 )
-    return root.sql(dialect=SQL_DIALECT)
+    return root.sql(dialect=SQL_DIALECT, comments=False)

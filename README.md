@@ -66,12 +66,12 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 
 ## Security properties
 
-- **SQL**: one read-only SELECT; tables allow-listed by the catalog, with CTE names resolved in scope; functions allow-listed in `gates.py` (system, table and session-context functions are refused); no time travel, sequences, bind or session variables, pivots, sampling, recursive CTEs or quoted identifiers; joins on declared keys; time bounds and LIMIT caps enforced.
-- **Answers**: every released line carries a verbatim quote from retrieved evidence. With the default extractive synthesizer no model-written sentence is released, and quotes are widened to whole sentences so a span cannot cut a number or drop a negation. Abstractive mode is refused in production.
+- **SQL**: one read-only SELECT, executed as re-serialised from the validated syntax tree; tables allow-listed by the catalog, with CTE names resolved in scope; functions allow-listed in `gates.py` (system, table and session-context functions are refused); no time travel, sequences, bind or session variables, pivots, sampling, recursive CTEs or quoted identifiers; joins on declared keys; time bounds and LIMIT caps enforced.
+- **Answers**: every released line carries a verbatim quote from retrieved evidence. With the default extractive synthesizer no model-written sentence is released, and each chosen passage is released whole, so no cut can drop a number, a condition or a negation. Chunk the corpus so each passage stands on its own. Abstractive mode is refused in production.
 - **Evidence**: passages with no data domain are shown to no one; retrieval failures are refusals.
 - **Identity**: RS256 only, issuer, audience, tenant and expiry checked; `upn` required; service-principal secrets are checked by Entra on every call.
 - **Tokens**: access tokens live only in an in-process vault, bound to the principal they were issued to. State, checkpoints, logs and responses carry a fingerprint.
-- **Checkpoints**: a run's state is deleted when it finishes or crashes; only runs waiting on a reviewer persist. The SQLite file is owner-only with secure delete on. Encrypt the store at rest.
+- **Checkpoints**: a run's state is deleted when it finishes or crashes; only runs waiting on a reviewer persist. The SQLite file is owner-only, with secure delete on and the write-ahead log truncated after each delete. Encrypt the store at rest.
 - **Errors**: warehouse and connector messages are logged server-side and not returned to callers.
 - **Environment**: any `APP_ENV` other than `dev`, `development`, `local` or `test` gets production rules.
 
@@ -80,7 +80,7 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 - Review decisions are serialised per run inside one API process. Run a single replica, or add a database lock, before scaling out.
 - An approved answer is returned to the reviewer's call; the original requester has no endpoint to fetch it.
 - The token vault is per process, so a run resumed on another replica cannot reach the warehouse and is refused.
-- The SQL policy is an allow-list over what sqlglot parses. It has been attacked by two review passes, not formally verified, and has never been run against a real Snowflake account.
+- The SQL policy is an allow-list over what sqlglot parses. It has been attacked by three review passes, not formally verified, and has never been run against a real Snowflake account.
 
 ## Verification status
 

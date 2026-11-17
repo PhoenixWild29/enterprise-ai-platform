@@ -64,9 +64,11 @@ def test_sqlite_store_is_owner_only_and_threads_can_be_forgotten(tmp_path):
     config = {"configurable": {"thread_id": "t-done"}}
     run_query(ASK, _operator(), graph, thread_id="t-done")
     assert graph.get_state(config).values["query"] == ASK
+    assert any(b"bearing" in f.read_bytes() for f in tmp_path.iterdir())
     forget_thread(saver, "t-done")
     assert graph.get_state(config).values == {}
-    assert b"bearing" not in path.read_bytes() or saver.conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
+    # Nothing of the run is left in the database file or its write-ahead log, with the connection still open.
+    assert not any(b"bearing" in f.read_bytes() or b"dana.ops" in f.read_bytes() for f in tmp_path.iterdir())
 
 
 def test_backend_selection(monkeypatch, tmp_path):

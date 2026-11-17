@@ -11,6 +11,7 @@ Backends (CHECKPOINT_BACKEND):
   memory             tests only; paused runs are lost on restart
 """
 
+import contextlib
 import os
 import sqlite3
 from pathlib import Path
@@ -23,6 +24,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 import schemas
 
 Backend = Literal["sqlite", "postgres", "memory"]
+_NO_LOCK = contextlib.nullcontext()
 DEFAULT_SQLITE_PATH = ".data/checkpoints.sqlite"
 
 
@@ -85,5 +87,11 @@ def make_checkpointer(backend: str | None = None) -> BaseCheckpointSaver:
 
 
 def forget_thread(checkpointer: BaseCheckpointSaver, thread_id: str) -> None:
-    """Delete every checkpoint of a finished run."""
+    """Delete every checkpoint of a finished run, including from the SQLite
+    write-ahead log, where deleted rows otherwise stay readable until the
+    connection closes."""
     checkpointer.delete_thread(thread_id)
+    conn = getattr(checkpointer, "conn", None)
+    if isinstance(conn, sqlite3.Connection):
+        with getattr(checkpointer, "lock", _NO_LOCK):
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
