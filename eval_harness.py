@@ -6,12 +6,11 @@ Tier 2: LLM-as-Judge over five rubric dimensions, with false negatives
         (a defective answer the system released) penalised 2x relative to
         false positives (a good answer the system withheld).
 
-Run:  python eval_harness.py [--tier 1|2|all] [--judge heuristic|llm] [--json out.json]
+Run:  python eval_harness.py [--tier 1|2|all] [--judge heuristic|llm] [--agents simulated|llm] [--json out.json]
 """
 
 import argparse
 import json
-import os
 import re
 import sys
 import time
@@ -43,6 +42,8 @@ from gates import (
     verbatim_citation_gate,
 )
 from graph import AgentDeps, build_graph, extractive_synthesizer, run_query
+from langgraph.graph.state import CompiledStateGraph
+from llm_agents import anthropic_completion, build_llm_deps
 from schemas import Citation, GateResult, GateStatus, Passage, Route
 from sqlglot import exp
 
@@ -50,20 +51,21 @@ Persona = Literal["operator", "finance", "service", "anonymous"]
 
 
 def persona_context(persona: Persona) -> AuthContext | None:
-    """Fresh, fully authenticated identity for a benchmark persona."""
+    """Fresh, fully authenticated identity for a benchmark persona. Benchmarks
+    always sign in through the simulated provider, whatever the API uses."""
     match persona:
         case "operator":
             return authenticate_user(
-                IDP.issue_user_token("dana.ops@contoso.com", "oid-operator", ["Lakehouse.Operator"])
+                IDP.issue_user_token("dana.ops@contoso.com", "oid-operator", ["Lakehouse.Operator"]), idp=IDP
             )
         case "finance":
             return authenticate_user(
-                IDP.issue_user_token("fay.fin@contoso.com", "oid-finance", ["Lakehouse.Finance"])
+                IDP.issue_user_token("fay.fin@contoso.com", "oid-finance", ["Lakehouse.Finance"]), idp=IDP
             )
         case "service":
             return authenticate_service(
                 TELEMETRY_SP_CLIENT_ID, TELEMETRY_SP_SECRET,
-                "nightly_telemetry_rollup", "scheduled__2026-11-17T00:00:00+00:00",
+                "nightly_telemetry_rollup", "scheduled__2026-11-17T00:00:00+00:00", idp=IDP,
             )
         case "anonymous":
             return None
@@ -516,27 +518,6 @@ def make_llm_judge(complete: Callable[[str], str]) -> JudgeFn:
     return judge
 
 
-def anthropic_completion(model: str | None = None) -> Callable[[str], str]:
-    """Completion function backed by the Anthropic API. Requires the
-    `anthropic` package, ANTHROPIC_API_KEY, and a model id (argument or
-    JUDGE_MODEL environment variable)."""
-    import anthropic  # imported lazily so the harness runs without it
-
-    model_id = model or os.environ.get("JUDGE_MODEL")
-    if not model_id:
-        raise RuntimeError("Set JUDGE_MODEL to the model id the judge should use.")
-    client = anthropic.Anthropic()
-
-    def complete(prompt: str) -> str:
-        message = client.messages.create(
-            model=model_id, max_tokens=1024, temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(block.text for block in message.content if block.type == "text")
-
-    return complete
-
-
 # --- Scoring -----------------------------------------------------------------
 
 ErrorType = Literal["none", "shortfall", "false_negative", "false_positive"]
@@ -680,12 +661,16 @@ def run_tier2(
     judge: JudgeFn = heuristic_judge,
     cases: tuple[EvalCase, ...] = TIER2_BENCHMARK,
     judge_name: str = "heuristic",
+    default_graph: CompiledStateGraph | None = None,
 ) -> Tier2Report:
+    """`default_graph` swaps the system under test for non-calibration cases,
+    for example a graph built on model-backed agents."""
     results: list[Tier2CaseResult] = []
     calibration_failures: list[str] = []
     for case in cases:
         ctx = persona_context(case.persona)
-        out = run_query(case.query, ctx, _VARIANT_GRAPHS[case.system_variant])
+        graph = default_graph if default_graph is not None and case.system_variant == "default" else _VARIANT_GRAPHS[case.system_variant]
+        out = run_query(case.query, ctx, graph)
         status = GateStatus(out.get("gate_status", GateStatus.REFUSED))
         released = status is GateStatus.PASSED
         verdict = None
@@ -754,6 +739,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Enterprise AI Platform evaluation harness")
     parser.add_argument("--tier", choices=("1", "2", "all"), default="all")
     parser.add_argument("--judge", choices=("heuristic", "llm"), default="heuristic")
+    parser.add_argument("--agents", choices=("simulated", "llm"), default="simulated",
+                        help="Tier 2 system under test: deterministic stand-ins or model-backed agents")
     parser.add_argument("--json", dest="json_path", help="Write the full report to this file")
     args = parser.parse_args(argv)
 
@@ -765,8 +752,9 @@ def main(argv: list[str] | None = None) -> int:
         report["tier1"] = tier1.model_dump(mode="json")
         ok &= tier1.ok
     if args.tier in ("2", "all"):
-        judge = make_llm_judge(anthropic_completion()) if args.judge == "llm" else heuristic_judge
-        tier2 = run_tier2(judge, judge_name=args.judge)
+        judge = make_llm_judge(anthropic_completion(model_env="JUDGE_MODEL")) if args.judge == "llm" else heuristic_judge
+        graph = build_graph(build_llm_deps(anthropic_completion())) if args.agents == "llm" else None
+        tier2 = run_tier2(judge, judge_name=args.judge, default_graph=graph)
         _print_tier2(tier2)
         report["tier2"] = tier2.model_dump(mode="json")
         ok &= tier2.ok

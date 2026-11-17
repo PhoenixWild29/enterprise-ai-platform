@@ -9,9 +9,11 @@ Headless path : Machine-to-Machine (M2M) client-credentials for scheduled
                 execution role; `service_account_id` and `airflow_dag_run_id`
                 are logged on every authentication.
 
-SIMULATION NOTE: Entra ID is simulated in-process. Tokens are real, verified
-JWTs but signed with HS256 and a local key; production Entra uses RS256 with
-JWKS discovery (swap `SimulatedEntraID` for MSAL's ConfidentialClientApplication).
+Identity providers (IDENTITY_PROVIDER):
+  simulated (default)  `SimulatedEntraID` below: in-process issuer, HS256 tokens
+                       signed with a local key. For development and evaluation.
+  entra                `entra.EntraIDProvider`: RS256 validation against the
+                       tenant's JWKS and token exchange through MSAL.
 """
 
 import base64
@@ -24,7 +26,7 @@ import secrets
 import time
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlglot import exp
@@ -174,17 +176,45 @@ class ServicePrincipal(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     client_id: str
-    secret_sha256: str
     service_account_id: str
     execution_role: str
     allowed_dag_ids: frozenset[str]
+    secret_sha256: str | None = Field(default=None, description="Simulated provider only")
+
+
+class DownstreamToken(BaseModel):
+    """Access token for Snowflake obtained by OBO or client credentials."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    access_token: str = Field(repr=False)
+    expires_at: datetime
+    scopes: tuple[str, ...] = ()
+
+
+class IdentityProvider(Protocol):
+    """What the platform needs from an identity provider. Implemented by
+    `SimulatedEntraID` here and by `entra.EntraIDProvider` for production."""
+
+    name: str
+
+    def validate_user_token(self, token: str) -> dict[str, Any]: ...
+
+    def exchange_on_behalf_of(self, user_token: str, scope: str) -> DownstreamToken: ...
+
+    def acquire_service_token(self, client_id: str, client_secret: str) -> DownstreamToken: ...
+
+    def service_principal(self, client_id: str) -> ServicePrincipal | None: ...
 
 
 class SimulatedEntraID:
     """In-process stand-in for the Entra ID token endpoint."""
 
+    name = "simulated"
+
     def __init__(self, signing_key: bytes | None = None) -> None:
         self._key = signing_key or secrets.token_bytes(32)
+        self._platform_client: tuple[str, str] | None = None
         self._confidential_clients: dict[str, str] = {}  # client_id -> secret hash
         self._service_principals: dict[str, ServicePrincipal] = {}
 
@@ -193,7 +223,9 @@ class SimulatedEntraID:
         return hashlib.sha256(secret.encode()).hexdigest()
 
     def register_confidential_client(self, client_id: str, client_secret: str) -> None:
+        """Register this API's own app registration (the OBO middle tier)."""
         self._confidential_clients[client_id] = self._hash(client_secret)
+        self._platform_client = (client_id, client_secret)
 
     def register_service_principal(
         self, client_id: str, client_secret: str, service_account_id: str,
@@ -263,6 +295,30 @@ class SimulatedEntraID:
     def service_principal(self, client_id: str) -> ServicePrincipal | None:
         return self._service_principals.get(client_id)
 
+    # -- IdentityProvider interface -----------------------------------------
+
+    def _downstream(self, token: str) -> DownstreamToken:
+        claims = self.validate(token, SNOWFLAKE_AUDIENCE)
+        return DownstreamToken(
+            access_token=token,
+            expires_at=datetime.fromtimestamp(claims["exp"], UTC),
+            scopes=tuple(str(claims.get("scp", "")).split()),
+        )
+
+    def validate_user_token(self, token: str) -> dict[str, Any]:
+        return self.validate(token, API_AUDIENCE)
+
+    def exchange_on_behalf_of(self, user_token: str, scope: str) -> DownstreamToken:
+        if self._platform_client is None:
+            raise AuthError("No confidential client is registered for the OBO exchange.")
+        client_id, client_secret = self._platform_client
+        return self._downstream(
+            self.acquire_token_on_behalf_of(user_token, client_id, client_secret, scope)
+        )
+
+    def acquire_service_token(self, client_id: str, client_secret: str) -> DownstreamToken:
+        return self._downstream(self.acquire_token_for_client(client_id, client_secret))
+
 
 # ---------------------------------------------------------------------------
 # Demo tenant wiring (override secrets through the environment)
@@ -296,72 +352,95 @@ def _snowflake_role_for(app_roles: list[str]) -> str:
     raise AuthError("User holds no app role that maps to a Snowflake role.")
 
 
-def authenticate_user(user_jwt: str, idp: SimulatedEntraID = IDP) -> AuthContext:
+def get_identity_provider() -> IdentityProvider:
+    """Provider named by IDENTITY_PROVIDER: `simulated` (default) or `entra`."""
+    choice = os.environ.get("IDENTITY_PROVIDER", "simulated").lower()
+    if choice == "simulated":
+        return IDP
+    if choice == "entra":
+        from entra import EntraIDProvider  # imported lazily: needs msal and PyJWT
+
+        return EntraIDProvider.from_env()
+    raise RuntimeError(f"Unknown IDENTITY_PROVIDER '{choice}' (use simulated or entra).")
+
+
+ACTIVE_IDP: IdentityProvider = get_identity_provider()
+
+
+def authenticate_user(user_jwt: str, idp: IdentityProvider | None = None) -> AuthContext:
     """User path: validate the human's JWT, run the OBO exchange, and build a
     Snowflake session identity that carries the human's claims."""
+    idp = idp or ACTIVE_IDP
     try:
-        role = _snowflake_role_for(idp.validate(user_jwt, API_AUDIENCE).get("roles", []))
-        obo_token = idp.acquire_token_on_behalf_of(
-            user_assertion=user_jwt, client_id=PLATFORM_CLIENT_ID,
-            client_secret=PLATFORM_CLIENT_SECRET, scope=f"session:role:{role}",
-        )
-        claims = idp.validate(obo_token, SNOWFLAKE_AUDIENCE)
+        claims = idp.validate_user_token(user_jwt)
+        upn = claims.get("upn") or claims.get("preferred_username")
+        oid = claims.get("oid")
+        if not upn or not oid:
+            raise AuthError("User token is missing identity claims (upn/oid).")
+        if OBO_REQUIRED_SCOPE not in str(claims.get("scp", "")).split():
+            raise AuthError(f"User token lacks the '{OBO_REQUIRED_SCOPE}' scope.")
+        role = _snowflake_role_for(claims.get("roles", []))
+        token = idp.exchange_on_behalf_of(user_jwt, f"session:role:{role}")
     except AuthError as err:
-        logger.warning("auth.user_obo.denied reason=%s", err)
+        logger.warning("auth.user_obo.denied provider=%s reason=%s", idp.name, err)
         raise
+    user_expiry = datetime.fromtimestamp(claims["exp"], UTC)
     ctx = AuthContext(
         auth_path=AuthPath.USER_OBO,
-        principal=claims["upn"],
-        object_id=claims["oid"],
-        snowflake_user=claims["upn"].upper(),  # Snowflake LOGIN_NAME = UPN
+        principal=upn,
+        object_id=oid,
+        snowflake_user=upn.upper(),  # Snowflake LOGIN_NAME = UPN
         snowflake_role=role,
         allowed_domains=SNOWFLAKE_ROLE_DOMAINS[role],
-        scopes=tuple(str(claims["scp"]).split()),
-        expires_at=datetime.fromtimestamp(claims["exp"], UTC),
-        token_fingerprint=_fingerprint(obo_token),
+        scopes=token.scopes,
+        expires_at=min(token.expires_at, user_expiry),
+        token_fingerprint=_fingerprint(token.access_token),
     )
-    logger.info("auth.user_obo.ok principal=%s role=%s", ctx.principal, ctx.snowflake_role)
+    logger.info(
+        "auth.user_obo.ok provider=%s principal=%s role=%s", idp.name, ctx.principal, ctx.snowflake_role
+    )
     return ctx
 
 
 def authenticate_service(
     client_id: str, client_secret: str, airflow_dag_id: str, airflow_dag_run_id: str,
-    idp: SimulatedEntraID = IDP,
+    idp: IdentityProvider | None = None,
 ) -> AuthContext:
     """Headless path: client-credentials for a scheduled DAG, bound to one
     scoped execution role and to the DAGs the principal is registered for."""
+    idp = idp or ACTIVE_IDP
     try:
-        token = idp.acquire_token_for_client(client_id, client_secret)
-        claims = idp.validate(token, SNOWFLAKE_AUDIENCE)
+        token = idp.acquire_service_token(client_id, client_secret)
         sp = idp.service_principal(client_id)
-        if sp is None or claims.get("idtyp") != "app":
-            raise AuthError("Token is not an app-only service principal token.")
+        if sp is None:
+            raise AuthError("Service principal is not registered with the platform.")
         if airflow_dag_id not in sp.allowed_dag_ids:
             raise AuthError(f"DAG '{airflow_dag_id}' is not permitted for this service principal.")
         if not airflow_dag_run_id.strip():
             raise AuthError("airflow_dag_run_id is required for headless execution.")
     except AuthError as err:
         logger.warning(
-            "auth.m2m.denied client_id=%s airflow_dag_id=%s airflow_dag_run_id=%s reason=%s",
-            client_id, airflow_dag_id, airflow_dag_run_id, err,
+            "auth.m2m.denied provider=%s client_id=%s airflow_dag_id=%s airflow_dag_run_id=%s reason=%s",
+            idp.name, client_id, airflow_dag_id, airflow_dag_run_id, err,
         )
         raise
     ctx = AuthContext(
         auth_path=AuthPath.M2M,
         principal=sp.service_account_id,
-        object_id=claims["oid"],
+        object_id=sp.service_account_id,
         snowflake_user=sp.service_account_id.split("@")[0].upper().replace("-", "_"),
         snowflake_role=sp.execution_role,
         allowed_domains=SNOWFLAKE_ROLE_DOMAINS[sp.execution_role],
-        expires_at=datetime.fromtimestamp(claims["exp"], UTC),
-        token_fingerprint=_fingerprint(token),
+        scopes=token.scopes,
+        expires_at=token.expires_at,
+        token_fingerprint=_fingerprint(token.access_token),
         service_account_id=sp.service_account_id,
         airflow_dag_id=airflow_dag_id,
         airflow_dag_run_id=airflow_dag_run_id,
     )
     logger.info(
-        "auth.m2m.ok service_account_id=%s airflow_dag_run_id=%s role=%s",
-        ctx.service_account_id, ctx.airflow_dag_run_id, ctx.snowflake_role,
+        "auth.m2m.ok provider=%s service_account_id=%s airflow_dag_run_id=%s role=%s",
+        idp.name, ctx.service_account_id, ctx.airflow_dag_run_id, ctx.snowflake_role,
     )
     return ctx
 

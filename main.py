@@ -6,7 +6,15 @@ Endpoints
   POST /v1/review/{thread_id}  human-in-the-loop decision on a paused run
   GET  /v1/tools               MCP tool definitions
   GET  /healthz                liveness and catalog size
-  POST /v1/dev/token           demo sign-in (disabled when APP_ENV=production)
+  POST /v1/dev/token           demo sign-in (simulated identity provider only)
+
+Configuration (environment):
+  APP_ENV              dev (default) | production
+  IDENTITY_PROVIDER    simulated (default) | entra        see auth.py, entra.py
+  CHECKPOINT_BACKEND   sqlite (default) | postgres | memory   see persistence.py
+  AGENT_BACKEND        simulated (default) | llm          see llm_agents.py
+In production the simulated identity provider and the in-memory checkpointer
+are refused at startup.
 
 Run:  uvicorn main:app --reload
 """
@@ -17,13 +25,11 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
-import schemas
 from auth import (
+    ACTIVE_IDP,
     API_AUDIENCE,
     APP_ROLE_TO_SNOWFLAKE_ROLE,
     IDP,
@@ -33,7 +39,8 @@ from auth import (
     authenticate_user,
 )
 from gates import DEFAULT_CATALOG, MCP_TOOL_REGISTRY
-from graph import build_graph
+from graph import AgentDeps, build_graph
+from persistence import make_checkpointer
 from schemas import AuditEvent, Citation, GateStatus, new_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -42,15 +49,34 @@ logger = logging.getLogger("platform.api")
 APP_ENV = os.environ.get("APP_ENV", "dev")
 REVIEWER_ROLE = "Lakehouse.Admin"
 
-# Checkpointed state holds our own Pydantic models and enums; register them so
-# the serializer will restore them when a paused run is resumed.
-_STATE_TYPES = [
-    ("schemas", name)
-    for name, obj in vars(schemas).items()
-    if isinstance(obj, type) and obj.__module__ == "schemas"
-]
-CHECKPOINTER = InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=_STATE_TYPES))
-GRAPH = build_graph(checkpointer=CHECKPOINTER)
+CHECKPOINT_BACKEND = os.environ.get("CHECKPOINT_BACKEND", "sqlite").lower()
+AGENT_BACKEND = os.environ.get("AGENT_BACKEND", "simulated").lower()
+DEV_TOKENS_ENABLED = APP_ENV != "production" and ACTIVE_IDP is IDP
+
+if APP_ENV == "production":
+    # Fail closed: a production process must not start on development stand-ins.
+    if ACTIVE_IDP is IDP:
+        raise RuntimeError("APP_ENV=production requires IDENTITY_PROVIDER=entra.")
+    if CHECKPOINT_BACKEND == "memory":
+        raise RuntimeError("APP_ENV=production requires a durable CHECKPOINT_BACKEND.")
+
+
+def _agent_deps() -> AgentDeps:
+    if AGENT_BACKEND == "simulated":
+        return AgentDeps()
+    if AGENT_BACKEND == "llm":
+        from llm_agents import anthropic_completion, build_llm_deps
+
+        return build_llm_deps(anthropic_completion())
+    raise RuntimeError(f"Unknown AGENT_BACKEND '{AGENT_BACKEND}' (use simulated or llm).")
+
+
+CHECKPOINTER = make_checkpointer(CHECKPOINT_BACKEND)
+GRAPH = build_graph(_agent_deps(), checkpointer=CHECKPOINTER)
+logger.info(
+    "startup env=%s identity_provider=%s checkpoint_backend=%s agent_backend=%s",
+    APP_ENV, ACTIVE_IDP.name, CHECKPOINT_BACKEND, AGENT_BACKEND,
+)
 
 app = FastAPI(
     title="Enterprise AI Platform",
@@ -184,7 +210,11 @@ def _run(query: str, ctx: AuthContext, include_audit: bool) -> QueryResponse:
 
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
-    return {"status": "ok", "env": APP_ENV, "catalog_tables": len(DEFAULT_CATALOG)}
+    return {
+        "status": "ok", "env": APP_ENV, "catalog_tables": len(DEFAULT_CATALOG),
+        "identity_provider": ACTIVE_IDP.name, "checkpoint_backend": CHECKPOINT_BACKEND,
+        "agent_backend": AGENT_BACKEND,
+    }
 
 
 @app.get("/v1/tools")
@@ -244,7 +274,7 @@ def review(
 @app.post("/v1/dev/token", response_model=DevTokenResponse)
 def dev_token(body: DevTokenRequest) -> DevTokenResponse:
     """Stand-in for Entra sign-in so the prototype can be exercised locally."""
-    if APP_ENV == "production":
+    if not DEV_TOKENS_ENABLED:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
     if body.role not in APP_ROLE_TO_SNOWFLAKE_ROLE:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown role '{body.role}'.")

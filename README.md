@@ -23,8 +23,11 @@ output node. A citation failure on the user path pauses for human review.
 | --- | --- |
 | `schemas.py` | `AgentState`, catalog, tool payload, MCP tool and OpenTelemetry span models |
 | `gates.py` | Thin-set refusal, SQL AST parser, payload and safety, verbatim citation gates |
-| `auth.py` | Entra ID OBO user path, M2M service-principal path, authorization, row-level security |
+| `auth.py` | Identity-provider interface, OBO user path, M2M path, authorization, row-level security |
+| `entra.py` | Microsoft Entra ID provider: RS256/JWKS validation, MSAL token exchange |
 | `graph.py` | LangGraph `StateGraph`, injectable agent dependencies |
+| `llm_agents.py` | Model-backed router, Text-to-SQL (schema retrieval, gate-driven repair) and synthesizer |
+| `persistence.py` | Checkpointer selection: SQLite, Postgres or memory |
 | `eval_harness.py` | Tier 1 gold-benchmark regression, Tier 2 judge with 2x false-negative penalty |
 | `main.py` | FastAPI service |
 
@@ -32,7 +35,7 @@ output node. A citation failure on the user path pauses for human review.
 
 ```bash
 pip install -r requirements.txt
-pytest -q                      # unit, graph and API tests
+pytest -q                      # unit, graph, API, provider and persistence tests
 python eval_harness.py         # both evaluation tiers
 uvicorn main:app --reload      # API at http://127.0.0.1:8000/docs
 ```
@@ -44,10 +47,23 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' -d '{"query":"List the latest telemetry readings"}'
 ```
 
-## What is simulated
+## Configuration
 
-- **Entra ID**: in-process issuer, HS256 tokens, dev-only default secrets. Production needs RS256/JWKS via MSAL.
-- **Models**: router, retriever, SQL generator and synthesizer are deterministic stand-ins behind `AgentDeps`.
-- **Snowflake**: the executor returns synthetic rows; the catalog is generated.
-- **Checkpointer**: in-memory, so paused reviews do not survive a restart.
-- **LLM judge**: `--judge llm` needs `anthropic`, `ANTHROPIC_API_KEY` and `JUDGE_MODEL`; CI uses the deterministic heuristic judge.
+| Variable | Values | Notes |
+| --- | --- | --- |
+| `APP_ENV` | `dev` (default), `production` | Production refuses the simulated identity provider and the memory checkpointer at startup |
+| `IDENTITY_PROVIDER` | `simulated` (default), `entra` | `entra` needs `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `SNOWFLAKE_SCOPE_PREFIX`; optional `ENTRA_API_AUDIENCE`, `SERVICE_PRINCIPALS_JSON` |
+| `CHECKPOINT_BACKEND` | `sqlite` (default), `postgres`, `memory` | `CHECKPOINT_SQLITE_PATH` (default `.data/checkpoints.sqlite`) or `CHECKPOINT_DSN` |
+| `AGENT_BACKEND` | `simulated` (default), `llm` | `llm` needs `pip install anthropic`, `ANTHROPIC_API_KEY`, `AGENT_MODEL` |
+| `JUDGE_MODEL` | model id | For `python eval_harness.py --judge llm`; add `--agents llm` to evaluate the model-backed agents |
+
+## Verification status
+
+| Component | Status |
+| --- | --- |
+| Gates, graph, API, eval harness | Tested in CI |
+| SQLite and Postgres checkpointers | Tested in CI, including resume after a simulated restart |
+| Entra provider | RS256 validation tested with a generated key pair; the JWKS download and MSAL calls are faked. Not yet run against a real tenant |
+| Model-backed agents and LLM judge | Logic tested with scripted completions. Not yet run against a live model |
+| Snowflake | Not connected. The executor returns synthetic rows and the catalog is generated |
+| Retriever | Keyword match over a six-passage sample corpus. No vector store |
