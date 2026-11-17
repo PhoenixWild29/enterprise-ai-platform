@@ -17,6 +17,7 @@ deterministic simulations so the graph runs with no LLM or Snowflake account.
 """
 
 import json
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -47,6 +48,7 @@ from gates import (
     citation_gate_node,
     parse_read_only_sql,
     payload_safety_gate_node,
+    resolve_table,
     sql_ast_gate_node,
     thin_set_gate_node,
 )
@@ -80,9 +82,11 @@ N_HITL = "hitl_review"
 N_RESPOND = "respond"
 N_REFUSAL = "refusal"
 
+logger = logging.getLogger("platform.graph")
+
 type RouterFn = Callable[[str], Route]
 type Retriever = Callable[[str], list[Passage]]
-type SQLGenerator = Callable[[str, Route], str]
+type SQLGenerator = Callable[[str, Route, frozenset[DataDomain]], str]
 type SQLExecutor = Callable[[str, AuthContext, Catalog], list[dict[str, Any]]]
 type Synthesizer = Callable[[str, list[Passage]], tuple[str, list[Citation]]]
 
@@ -175,7 +179,7 @@ def keyword_router(query: str) -> Route:
     return Route.RAG
 
 
-def template_sql_generator(query: str, route: Route) -> str:
+def template_sql_generator(query: str, route: Route, allowed_domains: frozenset[DataDomain] | None = None) -> str:
     """Stand-in for the Text-to-SQL model. A query prefixed with `sql:` is
     passed through verbatim so tests can simulate a compromised generator."""
     q = query.strip()
@@ -218,7 +222,7 @@ def simulated_executor(sql: str, ctx: AuthContext, catalog: Catalog) -> list[dic
     mirroring what Row-Level Security would return."""
     root = parse_read_only_sql(sql)
     spec = next(
-        (s for t in root.find_all(exp.Table) if (s := catalog.get(_table_fqn(t))) is not None),
+        (s for t in root.find_all(exp.Table) if (s := resolve_table(t, catalog)) is not None),
         None,
     )
     if spec is None:
@@ -332,11 +336,21 @@ def make_supervisor(deps: AgentDeps) -> Callable[[AgentState], dict[str, Any]]:
     return supervisor_router
 
 
+MAX_PASSAGES = 4
+
+
 def _retrieve(state: AgentState, deps: AgentDeps, node: str) -> dict[str, Any]:
     ctx = _ctx(state)
-    found = deps.retriever(state["query"])
-    passages = [p for p in found if p.domain is None or p.domain in ctx.allowed_domains]
+    try:
+        found = deps.retriever(state["query"])
+    except Exception as err:  # noqa: BLE001 - a retriever outage is a refusal, not a crash
+        logger.exception("retriever.failed node=%s", node)
+        return _refuse(node, f"Evidence retrieval failed ({type(err).__name__}).")
+    # A passage with no domain cannot be entitlement-checked, so it is not shown to anyone.
+    entitled = [p for p in found if p.domain is not None and p.domain in ctx.allowed_domains]
+    passages = sorted(entitled, key=lambda p: p.score, reverse=True)[:MAX_PASSAGES]
     return {
+        "gate_status": GateStatus.PASSED,
         "raw_passages": passages,
         "confidence_scores": [p.score for p in passages],
         "audit_telemetry": [
@@ -347,10 +361,9 @@ def _retrieve(state: AgentState, deps: AgentDeps, node: str) -> dict[str, Any]:
 
 
 def _generate_sql(state: AgentState, deps: AgentDeps, node: str, route: Route) -> dict[str, Any]:
-    sql = deps.sql_generator(state["query"], route)
-    payload = ToolPayload(
-        tool_name=TOOL_SNOWFLAKE_QUERY, arguments={"sql": sql}, principal=_ctx(state).principal
-    )
+    ctx = _ctx(state)
+    sql = deps.sql_generator(state["query"], route, ctx.allowed_domains)
+    payload = ToolPayload(tool_name=TOOL_SNOWFLAKE_QUERY, arguments={"sql": sql}, principal=ctx.principal)
     return {
         "generated_sql": sql,
         "tool_payload": payload,
@@ -378,6 +391,8 @@ def make_diagnostic_reasoner(deps: AgentDeps) -> Callable[[AgentState], dict[str
 
     def diagnostic_reasoner(state: AgentState) -> dict[str, Any]:
         update = _retrieve(state, deps, N_DIAG)
+        if update["gate_status"] != GateStatus.PASSED:
+            return update
         sql_update = _generate_sql(state, deps, N_DIAG, Route.DIAGNOSTIC)
         events = update["audit_telemetry"] + sql_update["audit_telemetry"]
         return update | sql_update | {"audit_telemetry": events}
@@ -402,7 +417,9 @@ def make_sql_executor(deps: AgentDeps) -> Callable[[AgentState], dict[str, Any]]
             secured_sql = apply_row_level_security(state["generated_sql"] or "", ctx, deps.catalog)
             rows = deps.executor(secured_sql, ctx, deps.catalog)
         except Exception as err:  # noqa: BLE001 - execution errors never leak partial data
-            return _refuse(N_EXEC, f"Execution failed ({type(err).__name__}): {err}")
+            # Warehouse messages can name objects the caller may not know exist: log them, do not return them.
+            logger.exception("executor.failed")
+            return _refuse(N_EXEC, f"Execution failed ({type(err).__name__}).")
         if not rows and state.get("route") == Route.TEXT_TO_SQL:
             return _refuse(N_EXEC, "Query returned no rows; there is no evidence to answer from.")
         row_passages = _rows_to_passages(rows)
@@ -557,8 +574,8 @@ def build_graph(
     g.add_conditional_edges(N_AUTH, _pass_or_refuse(N_SUPERVISOR), [N_SUPERVISOR, N_REFUSAL])
     g.add_conditional_edges(N_SUPERVISOR, _after_supervisor, [N_RAG, N_SQL, N_DIAG, N_REFUSAL])
 
-    g.add_edge(N_RAG, N_THIN)
-    g.add_edge(N_DIAG, N_THIN)
+    g.add_conditional_edges(N_RAG, _pass_or_refuse(N_THIN), [N_THIN, N_REFUSAL])
+    g.add_conditional_edges(N_DIAG, _pass_or_refuse(N_THIN), [N_THIN, N_REFUSAL])
     g.add_conditional_edges(N_THIN, _after_thin_set, [N_SYNTH, N_AST, N_REFUSAL])
 
     g.add_edge(N_SQL, N_AST)

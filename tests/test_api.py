@@ -35,6 +35,8 @@ def test_user_query_answers_with_citations():
     body = r.json()
     assert r.status_code == 200 and body["status"] == "PASSED" and body["route"] == "rag_retriever"
     assert len(body["citations"]) >= 2 and "audit" not in body
+    # A finished run leaves nothing in the checkpoint store.
+    assert main.GRAPH.get_state({"configurable": {"thread_id": body["thread_id"]}}).values == {}
 
 
 def test_sql_query_includes_audit_and_rls():
@@ -49,6 +51,20 @@ def test_refusals_return_200_with_reason():
     for q, needle in (("sql: DROP TABLE SCADA.TELEMETRY_001", "SECURITY"), ("What is the capital of France?", "thin_set"), ("total spend by cost center", "not entitled")):
         body = client.post("/v1/query", json={"query": q}, headers=OPERATOR).json()
         assert body["status"] == "REFUSED" and needle in body["refusal_reason"] and body["citations"] == []
+
+
+def test_a_crashed_run_leaves_no_checkpoints(monkeypatch):
+    def exploding(query, passages):
+        raise RuntimeError("synthesizer crashed")
+
+    monkeypatch.setattr(main, "GRAPH", build_graph(AgentDeps(synthesizer=exploding), checkpointer=main.CHECKPOINTER))
+    seen = []
+    real_forget = main.forget_thread
+    monkeypatch.setattr(main, "forget_thread", lambda cp, tid: (seen.append(tid), real_forget(cp, tid)))
+    crashing = TestClient(main.app, raise_server_exceptions=False)
+    r = crashing.post("/v1/query", json={"query": "What is the bearing temperature alarm limit for pump P-101?"}, headers=OPERATOR)
+    assert r.status_code == 500 and len(seen) == 1
+    assert main.GRAPH.get_state({"configurable": {"thread_id": seen[0]}}).values == {}
 
 
 def test_auth_failures():
@@ -79,6 +95,10 @@ def test_human_review_flow(monkeypatch):
     tid = paused["thread_id"]
 
     assert client.post(f"/v1/review/{tid}", json={"approved": True}, headers=OPERATOR).status_code == 403  # not admin
+    assert client.get(f"/v1/review/{tid}", headers=OPERATOR).status_code == 403
+    pending = client.get(f"/v1/review/{tid}", headers=ADMIN).json()
+    assert pending["draft_response"] == "Pump is fine." and pending["requested_by"] == "dana.ops@contoso.com"
+    assert "not verbatim" in pending["reason"] and pending["ticket"] == paused["hitl"]["ticket"]
     assert client.post("/v1/review/unknown-thread", json={"approved": True}, headers=ADMIN).status_code == 404
     approved = client.post(f"/v1/review/{tid}?include_audit=true", json={"approved": True}, headers=ADMIN).json()
     assert approved["status"] == "PASSED" and approved["answer"] == "Pump is fine."

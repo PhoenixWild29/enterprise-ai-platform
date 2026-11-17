@@ -84,3 +84,28 @@ def test_gates():
     print(u["audit_telemetry"][0].model_dump_json()[:300])
     print(MCP_TOOL_REGISTRY["snowflake_query"].model_dump(by_alias=True)["inputSchema"]["required"])
     print("ALL OK")
+
+
+def test_cte_names_are_resolved_in_scope_only():
+    from gates import sql_ast_gate
+
+    E, T, B = "MAINT.EQUIPMENT", "SCADA.TELEMETRY_000", "reading_ts >= '2026-01-01'"
+    in_scope = [
+        f"WITH a AS (SELECT equipment_id FROM {E}), b AS (SELECT equipment_id FROM a) SELECT * FROM b",
+        f"WITH a AS (SELECT equipment_id FROM {E}) SELECT * FROM (SELECT equipment_id FROM a) s",
+        f"WITH a AS (SELECT equipment_id FROM {E}), b AS (WITH c AS (SELECT equipment_id FROM a) SELECT equipment_id FROM c) SELECT * FROM b",
+        f"WITH a AS (SELECT equipment_id FROM {E}) SELECT equipment_id FROM a UNION ALL SELECT equipment_id FROM a",
+        f"SELECT e.site_id FROM {E} e WHERE e.equipment_id IN (WITH x AS (SELECT equipment_id FROM {T} WHERE {B}) SELECT equipment_id FROM x)",
+    ]
+    out_of_scope = [
+        "WITH a AS (SELECT * FROM a) SELECT * FROM a",
+        f"WITH a AS (SELECT * FROM b), b AS (SELECT equipment_id FROM {E}) SELECT * FROM a",
+        f"SELECT * FROM (WITH p AS (SELECT equipment_id FROM {E}) SELECT * FROM p) s JOIN p ON 1=1",
+        f"SELECT equipment_id FROM (WITH p AS (SELECT equipment_id FROM {E}) SELECT equipment_id FROM p) s UNION ALL SELECT equipment_id FROM p",
+        f"WITH a AS (WITH inner_only AS (SELECT equipment_id FROM {E}) SELECT equipment_id FROM inner_only) SELECT * FROM inner_only",
+        f"SELECT e.site_id, (SELECT COUNT(*) FROM x) FROM {E} e WHERE e.equipment_id IN (WITH x AS (SELECT equipment_id FROM {E}) SELECT equipment_id FROM x)",
+    ]
+    for sql in in_scope:
+        assert sql_ast_gate(sql).passed, sql
+    for sql in out_of_scope:
+        assert not sql_ast_gate(sql).passed, sql

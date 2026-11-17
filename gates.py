@@ -208,12 +208,75 @@ def _forbidden_node_types() -> tuple[type[exp.Expression], ...]:
 _FORBIDDEN_NODES = _forbidden_node_types()
 _QUERY_ROOTS: tuple[type[exp.Expression], ...] = (exp.Select, exp.SetOperation)
 
+# Tables are allow-listed by the catalog; functions are allow-listed here.
+# Anything else (system functions, table functions, context functions that
+# reveal session details, UDFs) is refused.
+_ALLOWED_FUNCTION_NAMES = (
+    "And", "Or", "Xor", "Case", "If", "Coalesce", "Nullif", "Cast", "TryCast",
+    "Avg", "Sum", "Count", "Min", "Max", "Median", "Stddev", "StddevPop", "StddevSamp",
+    "Variance", "VariancePop", "ApproxDistinct",
+    "Round", "Abs", "Floor", "Ceil", "Greatest", "Least",
+    "Lower", "Upper", "Trim", "Length", "Concat", "Substring",
+    "DateAdd", "DateSub", "DateDiff", "DateTrunc", "TimestampTrunc", "TimestampAdd",
+    "TimestampSub", "TimestampDiff", "Extract", "Year", "Month", "Day",
+    "CurrentTimestamp", "CurrentDate", "CurrentUser",
+    "RowNumber", "Rank", "DenseRank", "Lag", "Lead", "FirstValue", "LastValue",
+)
+_ALLOWED_FUNCTIONS: frozenset[type] = frozenset(
+    t for n in _ALLOWED_FUNCTION_NAMES if isinstance(t := getattr(exp, n, None), type)
+)
+# Clauses that widen what a SELECT can reach or do: time travel and change
+# tracking, bind/session variables, row-pattern and hierarchical queries,
+# pivots, sampling and semi-structured path access.
+_FORBIDDEN_CLAUSES: tuple[type[exp.Expression], ...] = tuple(
+    t
+    for n in ("HistoricalData", "Changes", "Parameter", "Placeholder", "SessionParameter", "Pivot",
+              "MatchRecognize", "Connect", "TableSample", "Bracket", "Lock")
+    if isinstance(t := getattr(exp, n, None), type)
+)
+_FORBIDDEN_ROW_SOURCES: tuple[type[exp.Expression], ...] = tuple(
+    t for n in ("Lateral", "Unnest", "TableFromRows", "Values") if isinstance(t := getattr(exp, n, None), type)
+)
+
+
+def _check_expression_policy(root: exp.Expression) -> None:
+    """Refuse functions and row sources that are not explicitly allowed."""
+    for node in root.find_all(exp.Func):
+        if type(node) not in _ALLOWED_FUNCTIONS:
+            name = node.name if isinstance(node, exp.Anonymous) else type(node).__name__
+            raise SQLValidationError(f"Function '{name.upper()}' is not on the allowed list.")
+    for node in root.find_all(*_FORBIDDEN_ROW_SOURCES):
+        raise SQLValidationError(
+            f"{type(node).__name__} row sources are not allowed; query catalog tables only."
+        )
+    for table in root.find_all(exp.Table):
+        if not isinstance(table.this, exp.Identifier):
+            raise SQLValidationError("Table functions are not allowed; query catalog tables only.")
+    for node in root.find_all(*_FORBIDDEN_CLAUSES):
+        raise SQLValidationError(f"{type(node).__name__} is not allowed in governed queries.")
+    for with_ in root.find_all(exp.With):
+        if with_.args.get("recursive"):
+            raise SQLValidationError("Recursive CTEs are not allowed.")
+    for ident in root.find_all(exp.Identifier):
+        if ident.quoted:
+            # A quoted name is a different, case-sensitive object in Snowflake.
+            raise SQLValidationError(f"Quoted identifier \"{ident.name}\" is not allowed.")
+    for column in root.find_all(exp.Column):
+        name = column.name.upper()
+        if column.args.get("db") or column.args.get("catalog"):
+            raise SQLValidationError(f"Column reference '{column.sql()}' must use a table alias, not a schema path.")
+        if name in ("NEXTVAL", "CURRVAL") or name.startswith("$"):
+            raise SQLValidationError(f"'{column.sql()}' is not allowed in governed queries.")
+        if not column.table and name.startswith("CURRENT_"):
+            raise SQLValidationError(f"Session context value '{name}' is not on the allowed list.")
+
 
 def parse_read_only_sql(sql: str) -> exp.Expression:
     """Parse SQL into an AST and enforce the SELECT-only policy.
 
     Raises SQLSecurityError for DML/DDL, statement stacking, or any
-    non-SELECT root. Raises SQLValidationError when the SQL cannot be parsed.
+    non-SELECT root. Raises SQLValidationError when the SQL cannot be parsed
+    or uses a function or row source that is not on the allowed list.
     """
     if not sql or not sql.strip():
         raise SQLValidationError("SQL is empty.")
@@ -221,6 +284,8 @@ def parse_read_only_sql(sql: str) -> exp.Expression:
         statements = [s for s in sqlglot.parse(sql, read=SQL_DIALECT) if s is not None]
     except SqlglotError as err:
         raise SQLValidationError(f"SQL failed to parse: {err}") from err
+    except RecursionError as err:
+        raise SQLValidationError("SQL is nested too deeply to validate.") from err
     if not statements:
         raise SQLValidationError("SQL contains no statements.")
 
@@ -234,11 +299,18 @@ def parse_read_only_sql(sql: str) -> exp.Expression:
     if len(statements) > 1:
         raise SQLSecurityError(f"Statement stacking detected ({len(statements)} statements).")
 
-    root = statements[0].unnest()
+    root = statements[0]
+    if isinstance(root, exp.Subquery):
+        # Clauses attached outside the parentheses (ORDER BY, OFFSET) would escape every check.
+        raise SQLValidationError("Remove the parentheses around the whole query.")
     if not isinstance(root, _QUERY_ROOTS):
         raise SQLSecurityError(
             f"Root statement is {type(root).__name__}; only SELECT is permitted."
         )
+    try:
+        _check_expression_policy(root)
+    except RecursionError as err:
+        raise SQLValidationError("SQL is nested too deeply to validate.") from err
     return root
 
 
@@ -246,12 +318,47 @@ def _table_fqn(table: exp.Table) -> str:
     return f"{table.db}.{table.name}".upper() if table.db else table.name.upper()
 
 
-def _cte_names(root: exp.Expression) -> set[str]:
-    return {cte.alias.upper() for cte in root.find_all(exp.CTE) if cte.alias}
+def resolve_table(table: exp.Table, catalog: Catalog) -> TableSpec | None:
+    """The catalog entry a table reference names, or None. A reference to
+    another database is never a catalog table, whatever its schema and name."""
+    if table.catalog and table.catalog.upper() != catalog.database.upper():
+        return None
+    return catalog.get(_table_fqn(table)) if table.db else None
 
 
-def _is_cte_ref(table: exp.Table, cte_names: set[str]) -> bool:
-    return not table.db and table.name.upper() in cte_names
+def _with_of(node: exp.Expression) -> exp.With | None:
+    found = node.args.get("with_") or node.args.get("with")
+    return found if isinstance(found, exp.With) else None
+
+
+def _is_cte_ref(table: exp.Table) -> bool:
+    """True only when an unqualified table name refers to a CTE that is
+    actually in scope at that point: defined by a WITH on an enclosing query,
+    or, inside a CTE body, by an earlier sibling in the same WITH. A CTE
+    defined in some other branch of the statement does not make the name a CTE."""
+    if table.args.get("db") is not None or table.args.get("catalog") is not None:
+        return False  # any qualifier, even an empty one (".NAME"), means it is not a CTE reference
+    name = table.name.upper()
+
+    def defines(ctes: list[exp.Expression]) -> bool:
+        return any(c.alias and c.alias.upper() == name for c in ctes)
+
+    node: exp.Expression = table
+    while node.parent is not None:
+        parent = node.parent
+        if isinstance(parent, exp.With) and isinstance(node, exp.CTE):
+            # Climbing out of a CTE body: only siblings defined before it are visible.
+            siblings = list(parent.expressions)
+            position = next(i for i, c in enumerate(siblings) if c is node)
+            if defines(siblings[:position]):
+                return True
+        else:
+            with_ = _with_of(parent)
+            # `node` is part of the query's body, not its WITH clause: every CTE of that WITH is visible.
+            if with_ is not None and node is not with_ and defines(list(with_.expressions)):
+                return True
+        node = parent
+    return False
 
 
 def _conjuncts(node: exp.Expression | None) -> Iterator[exp.Expression]:
@@ -269,13 +376,13 @@ def _conjuncts(node: exp.Expression | None) -> Iterator[exp.Expression]:
 type Scope = dict[str, TableSpec]  # alias (upper) -> catalog table
 
 
-def _scope_of(select: exp.Select, catalog: Catalog, cte_names: set[str]) -> Scope:
+def _scope_of(select: exp.Select, catalog: Catalog) -> Scope:
     """Catalog tables referenced directly by this SELECT (not nested ones)."""
     scope: Scope = {}
     for table in select.find_all(exp.Table):
-        if table.find_ancestor(exp.Select) is not select or _is_cte_ref(table, cte_names):
+        if table.find_ancestor(exp.Select) is not select or _is_cte_ref(table):
             continue
-        if spec := catalog.get(_table_fqn(table)):
+        if spec := resolve_table(table, catalog):
             scope[table.alias_or_name.upper()] = spec
     return scope
 
@@ -293,11 +400,11 @@ def _resolve_column(col: exp.Expression, scope: Scope) -> tuple[str, TableSpec, 
     return (owners[0][0], owners[0][1], name) if len(owners) == 1 else None
 
 
-def _check_tables(root: exp.Expression, catalog: Catalog, cte_names: set[str]) -> tuple[list[str], list[str]]:
+def _check_tables(root: exp.Expression, catalog: Catalog) -> tuple[list[str], list[str]]:
     violations: list[str] = []
     referenced: list[str] = []
     for table in root.find_all(exp.Table):
-        if _is_cte_ref(table, cte_names):
+        if _is_cte_ref(table):
             continue
         fqn = _table_fqn(table)
         if table.catalog and table.catalog.upper() != catalog.database:
@@ -311,11 +418,11 @@ def _check_tables(root: exp.Expression, catalog: Catalog, cte_names: set[str]) -
     return violations, referenced
 
 
-def _check_joins(select: exp.Select, scope: Scope, catalog: Catalog, cte_names: set[str]) -> list[str]:
+def _check_joins(select: exp.Select, scope: Scope, catalog: Catalog) -> list[str]:
     violations: list[str] = []
     for join in select.args.get("joins") or []:
         target = join.this
-        if not isinstance(target, exp.Table) or _is_cte_ref(target, cte_names):
+        if not isinstance(target, exp.Table) or _is_cte_ref(target):
             violations.append(
                 "JOIN to a derived relation (subquery/CTE/lateral) cannot be key-verified."
             )
@@ -410,11 +517,10 @@ def sql_ast_gate(sql: str | None, catalog: Catalog = DEFAULT_CATALOG) -> GateRes
     except SQLValidationError as err:
         return GateResult(gate=GATE_SQL_AST, status=GateStatus.REFUSED, reasons=[str(err)])
 
-    cte_names = _cte_names(root)
-    violations, referenced = _check_tables(root, catalog, cte_names)
+    violations, referenced = _check_tables(root, catalog)
     for select in root.find_all(exp.Select):
-        scope = _scope_of(select, catalog, cte_names)
-        violations += _check_joins(select, scope, catalog, cte_names)
+        scope = _scope_of(select, catalog)
+        violations += _check_joins(select, scope, catalog)
         violations += _check_time_bounds(select, scope)
 
     if not referenced and not violations:
@@ -509,20 +615,21 @@ def payload_safety_gate(
             root = parse_read_only_sql(args.sql)
         except SQLValidationError as err:
             return refuse(str(err), **details)
-        cte_names = _cte_names(root)
         sensor_tables = sorted(
             {
                 spec.fqn
                 for t in root.find_all(exp.Table)
-                if not _is_cte_ref(t, cte_names)
-                and (spec := catalog.get(_table_fqn(t))) is not None
+                if not _is_cte_ref(t)
+                and (spec := resolve_table(t, catalog)) is not None
                 and spec.is_sensor
             }
         )
         details["sensor_tables"] = sensor_tables
+        limit = _limit_value(root)
+        details["limit"] = limit
+        if root.args.get("limit") is not None and (limit is None or limit > max_sensor_limit):
+            return refuse(f"LIMIT must be a literal no greater than {max_sensor_limit}.", **details)
         if sensor_tables:
-            limit = _limit_value(root)
-            details["limit"] = limit
             if limit is None:
                 return refuse(
                     "Queries on sensor tables require a literal LIMIT on the outermost query.",
