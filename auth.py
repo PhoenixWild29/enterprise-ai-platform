@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -190,6 +191,45 @@ class DownstreamToken(BaseModel):
     access_token: str = Field(repr=False)
     expires_at: datetime
     scopes: tuple[str, ...] = ()
+
+
+class TokenVault:
+    """In-process store of downstream access tokens, keyed by fingerprint.
+
+    Workflow state and checkpoints carry only the fingerprint; the warehouse
+    executor exchanges it here for the real token. A token that is missing
+    (another replica, a restart) or expired raises AuthError, so the query is
+    refused rather than run under a different identity."""
+
+    def __init__(self) -> None:
+        self._tokens: dict[str, DownstreamToken] = {}
+        self._lock = threading.Lock()
+
+    def put(self, token: DownstreamToken) -> str:
+        fingerprint = _fingerprint(token.access_token)
+        now = datetime.now(UTC)
+        with self._lock:
+            for key in [k for k, t in self._tokens.items() if t.expires_at <= now]:
+                del self._tokens[key]
+            self._tokens[fingerprint] = token
+        return fingerprint
+
+    def get(self, fingerprint: str) -> DownstreamToken:
+        with self._lock:
+            token = self._tokens.get(fingerprint)
+            if token is not None and token.expires_at <= datetime.now(UTC):
+                del self._tokens[fingerprint]
+                token = None
+        if token is None:
+            raise AuthError("No valid warehouse token for this session; sign in again.")
+        return token
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._tokens)
+
+
+TOKEN_VAULT = TokenVault()
 
 
 class IdentityProvider(Protocol):
@@ -373,7 +413,7 @@ def authenticate_user(user_jwt: str, idp: IdentityProvider | None = None) -> Aut
     idp = idp or ACTIVE_IDP
     try:
         claims = idp.validate_user_token(user_jwt)
-        upn = claims.get("upn") or claims.get("preferred_username")
+        upn = claims.get("upn")  # preferred_username is mutable and not safe for authorization
         oid = claims.get("oid")
         if not upn or not oid:
             raise AuthError("User token is missing identity claims (upn/oid).")
@@ -394,7 +434,7 @@ def authenticate_user(user_jwt: str, idp: IdentityProvider | None = None) -> Aut
         allowed_domains=SNOWFLAKE_ROLE_DOMAINS[role],
         scopes=token.scopes,
         expires_at=min(token.expires_at, user_expiry),
-        token_fingerprint=_fingerprint(token.access_token),
+        token_fingerprint=TOKEN_VAULT.put(token),
     )
     logger.info(
         "auth.user_obo.ok provider=%s principal=%s role=%s", idp.name, ctx.principal, ctx.snowflake_role
@@ -433,7 +473,7 @@ def authenticate_service(
         allowed_domains=SNOWFLAKE_ROLE_DOMAINS[sp.execution_role],
         scopes=token.scopes,
         expires_at=token.expires_at,
-        token_fingerprint=_fingerprint(token.access_token),
+        token_fingerprint=TOKEN_VAULT.put(token),
         service_account_id=sp.service_account_id,
         airflow_dag_id=airflow_dag_id,
         airflow_dag_run_id=airflow_dag_run_id,

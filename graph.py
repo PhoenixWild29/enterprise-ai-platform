@@ -82,7 +82,7 @@ N_REFUSAL = "refusal"
 
 type RouterFn = Callable[[str], Route]
 type Retriever = Callable[[str], list[Passage]]
-type SQLGenerator = Callable[[str, Route], str]
+type SQLGenerator = Callable[[str, Route, frozenset[DataDomain]], str]
 type SQLExecutor = Callable[[str, AuthContext, Catalog], list[dict[str, Any]]]
 type Synthesizer = Callable[[str, list[Passage]], tuple[str, list[Citation]]]
 
@@ -175,7 +175,7 @@ def keyword_router(query: str) -> Route:
     return Route.RAG
 
 
-def template_sql_generator(query: str, route: Route) -> str:
+def template_sql_generator(query: str, route: Route, allowed_domains: frozenset[DataDomain] | None = None) -> str:
     """Stand-in for the Text-to-SQL model. A query prefixed with `sql:` is
     passed through verbatim so tests can simulate a compromised generator."""
     q = query.strip()
@@ -347,10 +347,9 @@ def _retrieve(state: AgentState, deps: AgentDeps, node: str) -> dict[str, Any]:
 
 
 def _generate_sql(state: AgentState, deps: AgentDeps, node: str, route: Route) -> dict[str, Any]:
-    sql = deps.sql_generator(state["query"], route)
-    payload = ToolPayload(
-        tool_name=TOOL_SNOWFLAKE_QUERY, arguments={"sql": sql}, principal=_ctx(state).principal
-    )
+    ctx = _ctx(state)
+    sql = deps.sql_generator(state["query"], route, ctx.allowed_domains)
+    payload = ToolPayload(tool_name=TOOL_SNOWFLAKE_QUERY, arguments={"sql": sql}, principal=ctx.principal)
     return {
         "generated_sql": sql,
         "tool_payload": payload,

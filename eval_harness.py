@@ -177,6 +177,18 @@ GOLD_BENCHMARK: tuple[GoldCase, ...] = (
          f"SELECT * FROM MAINT.EQUIPMENT WHERE equipment_id IN (SELECT equipment_id FROM {_T})",
          expect_reason_contains="lower bound"),
     _sql("sql-ref-10", "Unparseable SQL", "SELEC nope FROM", expect_reason_contains="parse"),
+    _sql("sql-ref-11", "System function in the select list",
+         f"SELECT t.sensor_id, SYSTEM$CANCEL_ALL_QUERIES(1) FROM {_T} t WHERE t.{_BOUND} LIMIT 10",
+         expect_reason_contains="not on the allowed list"),
+    _sql("sql-ref-12", "Table function in a scalar subquery",
+         f"SELECT t.sensor_id, (SELECT COUNT(*) FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())) FROM {_T} t "
+         f"WHERE t.{_BOUND} LIMIT 10", expect_reason_contains="not on the allowed list"),
+    _sql("sql-ref-13", "Session context function", "SELECT CURRENT_ROLE() FROM MAINT.EQUIPMENT",
+         expect_reason_contains="not on the allowed list"),
+    _sql("sql-ok-06", "Allowed aggregates, window and date functions",
+         f"SELECT t.sensor_id, ROUND(AVG(t.value), 2), COUNT(DISTINCT t.sensor_id), DATE_TRUNC('day', t.reading_ts), "
+         f"ROW_NUMBER() OVER (PARTITION BY t.sensor_id ORDER BY t.reading_ts) FROM {_T} t WHERE t.{_BOUND} "
+         "GROUP BY 1, 4, t.reading_ts LIMIT 10", GateStatus.PASSED),
     # --- SQL AST: security exceptions ---------------------------------------
     _sql("sql-sec-01", "DROP", f"DROP TABLE {_T}", expect_security=True),
     _sql("sql-sec-02", "DELETE", f"DELETE FROM {_T} WHERE 1=1", expect_security=True),

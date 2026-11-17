@@ -53,6 +53,22 @@ def test_postgres_checkpoint_survives_restart():
     _pause_then_resume_after_restart(lambda: postgres_checkpointer(dsn))
 
 
+def test_sqlite_store_is_owner_only_and_threads_can_be_forgotten(tmp_path):
+    import stat
+    from persistence import forget_thread
+
+    path = tmp_path / "cp.sqlite"
+    saver = sqlite_checkpointer(path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    graph = build_graph(AgentDeps(), checkpointer=saver)
+    config = {"configurable": {"thread_id": "t-done"}}
+    run_query(ASK, _operator(), graph, thread_id="t-done")
+    assert graph.get_state(config).values["query"] == ASK
+    forget_thread(saver, "t-done")
+    assert graph.get_state(config).values == {}
+    assert b"bearing" not in path.read_bytes() or saver.conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
+
+
 def test_backend_selection(monkeypatch, tmp_path):
     assert type(make_checkpointer("memory")).__name__ == "InMemorySaver"
     monkeypatch.setenv("CHECKPOINT_SQLITE_PATH", str(tmp_path / "x" / "cp.sqlite"))

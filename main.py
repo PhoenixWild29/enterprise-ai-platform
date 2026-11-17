@@ -12,9 +12,8 @@ Configuration (environment):
   APP_ENV              dev (default) | production
   IDENTITY_PROVIDER    simulated (default) | entra        see auth.py, entra.py
   CHECKPOINT_BACKEND   sqlite (default) | postgres | memory   see persistence.py
-  AGENT_BACKEND        simulated (default) | llm          see llm_agents.py
-In production the simulated identity provider and the in-memory checkpointer
-are refused at startup.
+  AGENT_BACKEND, WAREHOUSE_BACKEND, RETRIEVER_BACKEND, CATALOG_PATH    see runtime.py
+In production every development stand-in is refused at startup.
 
 Run:  uvicorn main:app --reload
 """
@@ -38,44 +37,42 @@ from auth import (
     authenticate_service,
     authenticate_user,
 )
-from gates import DEFAULT_CATALOG, MCP_TOOL_REGISTRY
-from graph import AgentDeps, build_graph
-from persistence import make_checkpointer
+from gates import MCP_TOOL_REGISTRY
+from graph import build_graph
+from persistence import forget_thread, make_checkpointer
+from runtime import RuntimeConfig, build_agent_deps
 from schemas import AuditEvent, Citation, GateStatus, new_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("platform.api")
 
-APP_ENV = os.environ.get("APP_ENV", "dev")
+APP_ENV = os.environ.get("APP_ENV", "dev").strip().lower()
+# Fail closed: any environment name that is not explicitly a development one gets production rules.
+IS_PRODUCTION = APP_ENV not in {"dev", "development", "local", "test"}
 REVIEWER_ROLE = "Lakehouse.Admin"
 
 CHECKPOINT_BACKEND = os.environ.get("CHECKPOINT_BACKEND", "sqlite").lower()
-AGENT_BACKEND = os.environ.get("AGENT_BACKEND", "simulated").lower()
-DEV_TOKENS_ENABLED = APP_ENV != "production" and ACTIVE_IDP is IDP
+RUNTIME = RuntimeConfig.from_env()
+DEV_TOKENS_ENABLED = not IS_PRODUCTION and ACTIVE_IDP is IDP
 
-if APP_ENV == "production":
+if IS_PRODUCTION:
     # Fail closed: a production process must not start on development stand-ins.
+    problems = RUNTIME.production_problems()
     if ACTIVE_IDP is IDP:
-        raise RuntimeError("APP_ENV=production requires IDENTITY_PROVIDER=entra.")
+        problems.append("IDENTITY_PROVIDER=entra (the simulated provider signs its own tokens)")
     if CHECKPOINT_BACKEND == "memory":
-        raise RuntimeError("APP_ENV=production requires a durable CHECKPOINT_BACKEND.")
-
-
-def _agent_deps() -> AgentDeps:
-    if AGENT_BACKEND == "simulated":
-        return AgentDeps()
-    if AGENT_BACKEND == "llm":
-        from llm_agents import anthropic_completion, build_llm_deps
-
-        return build_llm_deps(anthropic_completion())
-    raise RuntimeError(f"Unknown AGENT_BACKEND '{AGENT_BACKEND}' (use simulated or llm).")
-
+        problems.append("a durable CHECKPOINT_BACKEND (sqlite or postgres)")
+    if problems:
+        raise RuntimeError(f"APP_ENV={APP_ENV} is treated as production and requires: " + "; ".join(problems))
 
 CHECKPOINTER = make_checkpointer(CHECKPOINT_BACKEND)
-GRAPH = build_graph(_agent_deps(), checkpointer=CHECKPOINTER)
+DEPS = build_agent_deps(RUNTIME)
+GRAPH_CATALOG = DEPS.catalog
+GRAPH = build_graph(DEPS, checkpointer=CHECKPOINTER)
 logger.info(
-    "startup env=%s identity_provider=%s checkpoint_backend=%s agent_backend=%s",
-    APP_ENV, ACTIVE_IDP.name, CHECKPOINT_BACKEND, AGENT_BACKEND,
+    "startup env=%s identity_provider=%s checkpoint_backend=%s agents=%s warehouse=%s retriever=%s catalog=%s",
+    APP_ENV, ACTIVE_IDP.name, CHECKPOINT_BACKEND, RUNTIME.agent_backend, RUNTIME.warehouse_backend,
+    RUNTIME.retriever_backend, RUNTIME.catalog_source,
 )
 
 app = FastAPI(
@@ -196,6 +193,8 @@ def _run(query: str, ctx: AuthContext, include_audit: bool) -> QueryResponse:
     state["auth_context"] = ctx.model_dump(mode="json")
     thread_id = state["trace_id"]
     out = GRAPH.invoke(state, config=_config(thread_id))
+    if not out.get("__interrupt__"):
+        forget_thread(CHECKPOINTER, thread_id)  # keep state on disk only while a reviewer is pending
     logger.info(
         "query.done thread_id=%s principal=%s status=%s route=%s",
         thread_id, ctx.principal, out.get("gate_status"), out.get("route"),
@@ -211,9 +210,10 @@ def _run(query: str, ctx: AuthContext, include_audit: bool) -> QueryResponse:
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
     return {
-        "status": "ok", "env": APP_ENV, "catalog_tables": len(DEFAULT_CATALOG),
+        "status": "ok", "env": APP_ENV, "catalog_tables": len(GRAPH_CATALOG),
         "identity_provider": ACTIVE_IDP.name, "checkpoint_backend": CHECKPOINT_BACKEND,
-        "agent_backend": AGENT_BACKEND,
+        "agent_backend": RUNTIME.agent_backend, "warehouse_backend": RUNTIME.warehouse_backend,
+        "retriever_backend": RUNTIME.retriever_backend, "catalog": RUNTIME.catalog_source,
     }
 
 
@@ -264,6 +264,8 @@ def review(
         Command(resume={"approved": body.approved, "reviewer": reviewer.principal, "comment": body.comment}),
         config=_config(thread_id),
     )
+    if not out.get("__interrupt__"):
+        forget_thread(CHECKPOINTER, thread_id)
     logger.info(
         "review.done thread_id=%s reviewer=%s approved=%s status=%s",
         thread_id, reviewer.principal, body.approved, out.get("gate_status"),

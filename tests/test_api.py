@@ -35,6 +35,8 @@ def test_user_query_answers_with_citations():
     body = r.json()
     assert r.status_code == 200 and body["status"] == "PASSED" and body["route"] == "rag_retriever"
     assert len(body["citations"]) >= 2 and "audit" not in body
+    # A finished run leaves nothing in the checkpoint store.
+    assert main.GRAPH.get_state({"configurable": {"thread_id": body["thread_id"]}}).values == {}
 
 
 def test_sql_query_includes_audit_and_rls():

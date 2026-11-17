@@ -13,6 +13,10 @@ four operations the auth module needs:
 Configuration (EntraIDProvider.from_env):
   ENTRA_TENANT_ID, ENTRA_CLIENT_ID, ENTRA_CLIENT_SECRET   this API's app registration
   ENTRA_API_AUDIENCE          audience of inbound user tokens (default api://<client id>)
+  ENTRA_ALLOWED_CLIENT_IDS    optional comma-separated allow-list for the token's azp/appid
+
+The app registration must issue v2.0 tokens with the optional `upn` claim;
+`preferred_username` is mutable and is not accepted as an identity.
   SNOWFLAKE_SCOPE_PREFIX      Snowflake OAuth resource, e.g. api://<snowflake app id>
   SERVICE_PRINCIPALS_JSON     [{"client_id": "...", "service_account_id": "...",
                                 "execution_role": "...", "allowed_dag_ids": ["..."]}]
@@ -31,6 +35,7 @@ type KeyResolver = Callable[[str], Any]  # token -> public key
 type MsalAppFactory = Callable[[str, str], Any]  # (client_id, client_secret) -> ConfidentialClientApplication
 
 AUTHORITY_HOST = "https://login.microsoftonline.com"
+CLOCK_SKEW_SECONDS = 60
 
 
 class EntraIDProvider:
@@ -44,6 +49,7 @@ class EntraIDProvider:
         snowflake_scope_prefix: str,
         api_audience: str | None = None,
         service_principals: list[ServicePrincipal] | None = None,
+        allowed_client_ids: list[str] | None = None,
         *,
         key_resolver: KeyResolver | None = None,
         msal_app_factory: MsalAppFactory | None = None,
@@ -60,7 +66,8 @@ class EntraIDProvider:
         self.jwks_uri = f"{self.authority}/discovery/v2.0/keys"
         self._key_resolver = key_resolver or self._default_key_resolver()
         self._msal_app_factory = msal_app_factory or self._default_msal_app
-        self._apps: dict[str, Any] = {}
+        self._platform_app: Any = None
+        self.allowed_client_ids = frozenset(allowed_client_ids or ())
         self._service_principals: dict[str, ServicePrincipal] = {}
         for sp in service_principals or []:
             if sp.execution_role not in SNOWFLAKE_ROLE_DOMAINS:
@@ -83,6 +90,7 @@ class EntraIDProvider:
             snowflake_scope_prefix=os.environ.get("SNOWFLAKE_SCOPE_PREFIX", ""),
             api_audience=os.environ.get("ENTRA_API_AUDIENCE") or None,
             service_principals=principals,
+            allowed_client_ids=[c for c in os.environ.get("ENTRA_ALLOWED_CLIENT_IDS", "").split(",") if c.strip()],
         )
 
     def _default_key_resolver(self) -> KeyResolver:
@@ -105,12 +113,11 @@ class EntraIDProvider:
             client_id, client_credential=client_secret, authority=self.authority
         )
 
-    def _app(self, client_id: str, client_secret: str) -> Any:
-        # One MSAL app per client keeps its token cache; a changed secret gets a new app.
-        key = f"{client_id}:{hash(client_secret)}"
-        if key not in self._apps:
-            self._apps[key] = self._msal_app_factory(client_id, client_secret)
-        return self._apps[key]
+    def _platform(self) -> Any:
+        # Only this API's own app registration is cached; its secret is fixed for the process.
+        if self._platform_app is None:
+            self._platform_app = self._msal_app_factory(self.client_id, self._client_secret)
+        return self._platform_app
 
     # -- identity provider operations ---------------------------------------
 
@@ -126,6 +133,7 @@ class EntraIDProvider:
                 audience=self.api_audience,
                 issuer=self.issuer,
                 options={"require": ["exp", "iat", "iss", "aud"]},
+                leeway=CLOCK_SKEW_SECONDS,
             )
         except jwt.ExpiredSignatureError as err:
             raise AuthError("Token is expired.") from err
@@ -139,6 +147,8 @@ class EntraIDProvider:
             raise AuthError("Signing key could not be resolved.") from err
         if claims.get("tid") != self.tenant_id:
             raise AuthError("Token was issued for a different tenant.")
+        if self.allowed_client_ids and (claims.get("azp") or claims.get("appid")) not in self.allowed_client_ids:
+            raise AuthError("Token was issued to a client application that is not allowed.")
         return claims
 
     @staticmethod
@@ -157,15 +167,17 @@ class EntraIDProvider:
 
     def exchange_on_behalf_of(self, user_token: str, scope: str) -> DownstreamToken:
         target = f"{self.snowflake_scope_prefix}/{scope}"
-        app = self._app(self.client_id, self._client_secret)
-        result = app.acquire_token_on_behalf_of(user_assertion=user_token, scopes=[target])
+        result = self._platform().acquire_token_on_behalf_of(user_assertion=user_token, scopes=[target])
         return self._to_token(result, (scope,), "On-behalf-of exchange")
 
     def acquire_service_token(self, client_id: str, client_secret: str) -> DownstreamToken:
         if client_id not in self._service_principals:
             raise AuthError("Service principal authentication failed.")
         target = f"{self.snowflake_scope_prefix}/.default"
-        result = self._app(client_id, client_secret).acquire_token_for_client(scopes=[target])
+        # A fresh MSAL app per call: nothing is cached per presented secret, so a wrong
+        # or revoked secret is always checked by Entra and failed attempts leave no state.
+        app = self._msal_app_factory(client_id, client_secret)
+        result = app.acquire_token_for_client(scopes=[target])
         return self._to_token(result, (".default",), "Service principal authentication")
 
     def service_principal(self, client_id: str) -> ServicePrincipal | None:

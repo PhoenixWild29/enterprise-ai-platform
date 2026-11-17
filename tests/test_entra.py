@@ -46,7 +46,7 @@ def provider(result=None, apps=None):
 def token(key=KEY, alg="RS256", **overrides):
     now = int(time.time())
     claims = {"iss": f"https://login.microsoftonline.com/{TENANT}/v2.0", "aud": AUD, "tid": TENANT,
-              "iat": now, "nbf": now, "exp": now + 600, "oid": "oid-9", "preferred_username": "dana.ops@contoso.com",
+              "iat": now, "nbf": now, "exp": now + 600, "oid": "oid-9", "upn": "dana.ops@contoso.com",
               "roles": ["Lakehouse.Operator"], "scp": "access_as_user"} | overrides
     return jwt.encode({k: v for k, v in claims.items() if v is not None}, key, algorithm=alg, headers={"kid": "k1"})
 
@@ -67,7 +67,8 @@ def test_user_path_validates_rs256_and_exchanges_on_behalf_of():
     (dict(aud="api://someone-else"), "audience"),
     (dict(iss="https://login.microsoftonline.com/evil/v2.0"), "issuer"),
     (dict(tid="other-tenant"), "different tenant"),
-    (dict(exp=int(time.time()) - 5), "expired"),
+    (dict(exp=int(time.time()) - 300), "expired"),
+    (dict(upn=None, preferred_username="dana.ops@contoso.com"), "identity claims"),
     (dict(scp="User.Read"), "access_as_user"),
     (dict(roles=["Nope"]), "no app role"),
     (dict(oid=None), "identity claims"),
@@ -77,13 +78,34 @@ def test_user_token_rejections(bad, reason):
         authenticate_user(token(**bad), idp=provider())
 
 
+def _forged(alg, sign):
+    """A token with valid claims, re-signed by an attacker under another algorithm."""
+    import base64, json
+
+    def b64(raw):
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    _, payload, _ = token().split(".")
+    signing_input = f"{b64(json.dumps({'alg': alg, 'typ': 'JWT', 'kid': 'k1'}).encode())}.{payload}"
+    return f"{signing_input}.{b64(sign(signing_input.encode()))}"
+
+
 def test_signature_and_algorithm_attacks_are_rejected():
-    with pytest.raises(AuthError):
+    import hashlib, hmac
+    from cryptography.hazmat.primitives import serialization
+
+    with pytest.raises(AuthError, match="InvalidSignatureError"):
         authenticate_user(token(key=OTHER_KEY), idp=provider())  # signed by another key
-    with pytest.raises(AuthError):
-        authenticate_user(token(key="shared-secret-shared-secret-shared-secret", alg="HS256"), idp=provider())  # algorithm downgrade
+    # Algorithm confusion: HS256 keyed with the provider's own public key.
+    public_pem = KEY.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    confused = _forged("HS256", lambda data: hmac.new(public_pem, data, hashlib.sha256).digest())
+    with pytest.raises(AuthError, match="InvalidAlgorithmError"):
+        authenticate_user(confused, idp=provider())
+    with pytest.raises(AuthError, match="InvalidAlgorithmError"):
+        authenticate_user(_forged("none", lambda data: b""), idp=provider())
     with pytest.raises(AuthError):
         authenticate_user("not.a.jwt", idp=provider())
+    assert provider().validate_user_token(token(exp=int(time.time()) - 20))["oid"] == "oid-9"  # inside clock-skew leeway
 
     def broken_resolver(tok):
         raise ConnectionError("jwks unreachable")
@@ -113,6 +135,29 @@ def test_service_path():
         authenticate_service("sp-rollup", "sp-secret", "rogue_dag", "r1", idp=provider())
     with pytest.raises(AuthError, match="invalid_client"):
         authenticate_service("sp-rollup", "wrong", "nightly_telemetry_rollup", "r1", idp=provider({"error": "invalid_client"}))
+
+
+def test_service_secrets_are_never_cached():
+    apps = []
+    idp = provider(apps=apps)
+    for secret in ("right-secret", "right-secret", "wrong-1", "wrong-2"):
+        authenticate_service("sp-rollup", secret, "nightly_telemetry_rollup", "r1", idp=idp)
+    # Every call reaches the identity provider with the presented secret, and nothing is kept per secret.
+    assert [a[1] for a in apps] == ["right-secret", "right-secret", "wrong-1", "wrong-2"]
+    assert not hasattr(idp, "_apps") and idp._platform_app is None
+    authenticate_user(token(), idp=idp)
+    authenticate_user(token(), idp=idp)
+    assert [a[:2] for a in apps[4:]] == [(CLIENT, "s3cret")]  # the platform's own app is built once
+
+
+def test_client_application_allow_list():
+    idp = EntraIDProvider(TENANT, CLIENT, "s3cret", "api://snowflake-app", allowed_client_ids=["spa-frontend"],
+                          key_resolver=lambda t: KEY.public_key(),
+                          msal_app_factory=lambda a, b: FakeMsalApp({"access_token": "x", "expires_in": 60}))
+    assert authenticate_user(token(azp="spa-frontend"), idp=idp).principal == "dana.ops@contoso.com"
+    for bad in (dict(azp="some-other-app"), dict()):
+        with pytest.raises(AuthError, match="client application"):
+            authenticate_user(token(**bad), idp=idp)
 
 
 def test_provider_selection_from_environment(monkeypatch):

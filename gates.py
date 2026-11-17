@@ -208,12 +208,49 @@ def _forbidden_node_types() -> tuple[type[exp.Expression], ...]:
 _FORBIDDEN_NODES = _forbidden_node_types()
 _QUERY_ROOTS: tuple[type[exp.Expression], ...] = (exp.Select, exp.SetOperation)
 
+# Tables are allow-listed by the catalog; functions are allow-listed here.
+# Anything else (system functions, table functions, context functions that
+# reveal session details, UDFs) is refused.
+_ALLOWED_FUNCTION_NAMES = (
+    "And", "Or", "Xor", "Case", "If", "Coalesce", "Nullif", "Cast", "TryCast",
+    "Avg", "Sum", "Count", "Min", "Max", "Median", "Stddev", "StddevPop", "StddevSamp",
+    "Variance", "VariancePop", "ApproxDistinct",
+    "Round", "Abs", "Floor", "Ceil", "Greatest", "Least",
+    "Lower", "Upper", "Trim", "Length", "Concat", "Substring",
+    "DateAdd", "DateSub", "DateDiff", "DateTrunc", "TimestampTrunc", "TimestampAdd",
+    "TimestampSub", "TimestampDiff", "Extract", "Year", "Month", "Day",
+    "CurrentTimestamp", "CurrentDate", "CurrentUser",
+    "RowNumber", "Rank", "DenseRank", "Lag", "Lead", "FirstValue", "LastValue",
+)
+_ALLOWED_FUNCTIONS: frozenset[type] = frozenset(
+    t for n in _ALLOWED_FUNCTION_NAMES if isinstance(t := getattr(exp, n, None), type)
+)
+_FORBIDDEN_ROW_SOURCES: tuple[type[exp.Expression], ...] = tuple(
+    t for n in ("Lateral", "Unnest", "TableFromRows", "Values") if isinstance(t := getattr(exp, n, None), type)
+)
+
+
+def _check_expression_policy(root: exp.Expression) -> None:
+    """Refuse functions and row sources that are not explicitly allowed."""
+    for node in root.find_all(exp.Func):
+        if type(node) not in _ALLOWED_FUNCTIONS:
+            name = node.name if isinstance(node, exp.Anonymous) else type(node).__name__
+            raise SQLValidationError(f"Function '{name.upper()}' is not on the allowed list.")
+    for node in root.find_all(*_FORBIDDEN_ROW_SOURCES):
+        raise SQLValidationError(
+            f"{type(node).__name__} row sources are not allowed; query catalog tables only."
+        )
+    for table in root.find_all(exp.Table):
+        if not isinstance(table.this, exp.Identifier):
+            raise SQLValidationError("Table functions are not allowed; query catalog tables only.")
+
 
 def parse_read_only_sql(sql: str) -> exp.Expression:
     """Parse SQL into an AST and enforce the SELECT-only policy.
 
     Raises SQLSecurityError for DML/DDL, statement stacking, or any
-    non-SELECT root. Raises SQLValidationError when the SQL cannot be parsed.
+    non-SELECT root. Raises SQLValidationError when the SQL cannot be parsed
+    or uses a function or row source that is not on the allowed list.
     """
     if not sql or not sql.strip():
         raise SQLValidationError("SQL is empty.")
@@ -221,6 +258,8 @@ def parse_read_only_sql(sql: str) -> exp.Expression:
         statements = [s for s in sqlglot.parse(sql, read=SQL_DIALECT) if s is not None]
     except SqlglotError as err:
         raise SQLValidationError(f"SQL failed to parse: {err}") from err
+    except RecursionError as err:
+        raise SQLValidationError("SQL is nested too deeply to validate.") from err
     if not statements:
         raise SQLValidationError("SQL contains no statements.")
 
@@ -239,6 +278,10 @@ def parse_read_only_sql(sql: str) -> exp.Expression:
         raise SQLSecurityError(
             f"Root statement is {type(root).__name__}; only SELECT is permitted."
         )
+    try:
+        _check_expression_policy(root)
+    except RecursionError as err:
+        raise SQLValidationError("SQL is nested too deeply to validate.") from err
     return root
 
 

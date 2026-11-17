@@ -1,6 +1,10 @@
 """persistence.py - Checkpointer selection for the LangGraph workflow.
 
 A checkpointer is what lets a run pause for human review and resume later.
+Checkpoints contain the run's full state, including query results, so the
+API deletes a thread's checkpoints as soon as the run finishes (see
+`forget_thread`); only runs waiting on a reviewer stay on disk. Encrypt the
+store at rest in production.
 Backends (CHECKPOINT_BACKEND):
   sqlite   (default) single-file, survives restarts; one API process
   postgres           shared store for multiple API replicas (CHECKPOINT_DSN)
@@ -38,6 +42,8 @@ def sqlite_checkpointer(path: str | os.PathLike[str] = DEFAULT_SQLITE_PATH) -> B
 
     db_path = Path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.touch(mode=0o600, exist_ok=True)  # paused runs hold query results: owner-only
+    os.chmod(db_path, 0o600)
     # FastAPI runs sync endpoints on a thread pool; SqliteSaver serialises access itself.
     conn = sqlite3.connect(db_path, check_same_thread=False)
     saver = SqliteSaver(conn, serde=state_serializer())
@@ -47,11 +53,15 @@ def sqlite_checkpointer(path: str | os.PathLike[str] = DEFAULT_SQLITE_PATH) -> B
 
 def postgres_checkpointer(dsn: str) -> BaseCheckpointSaver:
     from langgraph.checkpoint.postgres import PostgresSaver
-    from psycopg import Connection
     from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
 
-    conn = Connection.connect(dsn, autocommit=True, prepare_threshold=0, row_factory=dict_row)
-    saver = PostgresSaver(conn, serde=state_serializer())
+    # A pool replaces dead connections, so a dropped connection is not an outage.
+    pool = ConnectionPool(
+        dsn, min_size=1, max_size=10, open=True, check=ConnectionPool.check_connection,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+    )
+    saver = PostgresSaver(pool, serde=state_serializer())
     saver.setup()  # creates the checkpoint tables on first use
     return saver
 
@@ -71,3 +81,8 @@ def make_checkpointer(backend: str | None = None) -> BaseCheckpointSaver:
             return postgres_checkpointer(dsn)
         case _:
             raise RuntimeError(f"Unknown CHECKPOINT_BACKEND '{choice}' (use sqlite, postgres or memory).")
+
+
+def forget_thread(checkpointer: BaseCheckpointSaver, thread_id: str) -> None:
+    """Delete every checkpoint of a finished run."""
+    checkpointer.delete_thread(thread_id)
