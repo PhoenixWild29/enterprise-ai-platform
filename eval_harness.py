@@ -140,7 +140,7 @@ def _snowflake(sql: str, **args: Any) -> dict[str, Any]:
 GOLD_BENCHMARK: tuple[GoldCase, ...] = (
     # --- SQL AST: accepted ---------------------------------------------------
     _sql("sql-ok-01", "Bounded single-table aggregate",
-         f"SELECT sensor_id, AVG(value) FROM {_T} WHERE {_BOUND} GROUP BY 1 LIMIT 100",
+         f"SELECT sensor_id, AVG(value) AS avg_value FROM {_T} WHERE {_BOUND} GROUP BY 1 LIMIT 100",
          GateStatus.PASSED, expect_tables=[_T]),
     _sql("sql-ok-02", "FK to PK join with BETWEEN bound",
          f"SELECT t.value, e.site_id FROM {_T} t JOIN MAINT.EQUIPMENT e ON t.equipment_id = e.equipment_id "
@@ -227,6 +227,15 @@ GOLD_BENCHMARK: tuple[GoldCase, ...] = (
     _sql("sql-ref-37", "Join hidden in parentheses",
          "SELECT COUNT(*) AS n FROM (MAINT.WORK_ORDERS_000 AS w JOIN MAINT.WORK_ORDERS_001 AS x ON 1=1) "
          "WHERE w.opened_at >= '2026-01-01' AND x.opened_at >= '2026-01-01'", expect_reason_contains="Parenthesised joins"),
+    _sql("sql-ref-38", "Message carried in a table alias through an unnamed aggregate",
+         f"SELECT MAX(pump_is_safe_to_restart.value) FROM {_T} pump_is_safe_to_restart WHERE pump_is_safe_to_restart.{_BOUND} LIMIT 1",
+         expect_reason_contains="Name this output"),
+    _sql("sql-ref-39", "Rows manufactured by grouping sets",
+         f"SELECT COUNT(*) AS n FROM (SELECT COUNT(*) AS n FROM {_T} t WHERE t.{_BOUND} GROUP BY GROUPING SETS ((),(),(),(),(),(),())) x LIMIT 1",
+         expect_reason_contains="GROUP BY may list only"),
+    _sql("sql-ref-40", "Rows manufactured by rollup",
+         f"SELECT t.sensor_id, COUNT(*) AS n FROM {_T} t WHERE t.{_BOUND} GROUP BY ROLLUP(t.sensor_id) LIMIT 5",
+         expect_reason_contains="GROUP BY may list only"),
     _sql("sql-ref-31", "Star with renamed columns",
          f"SELECT * RENAME (sensor_id AS wire_money) FROM {_T} t WHERE t.{_BOUND} LIMIT 1",
          expect_reason_contains="SELECT list may contain only"),

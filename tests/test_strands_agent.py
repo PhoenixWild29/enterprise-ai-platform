@@ -73,6 +73,30 @@ def test_a_query_cannot_return_text_its_author_made_up():
                           deps=AgentDeps(executor=echoing_warehouse))
         assert model.last_tool_result(1).startswith("REFUSED [sql_ast_parser]"), select
         assert out["gate_status"] == "REFUSED" and "185" not in out["final_response"] and out["execution_results"] == []
+    # An unnamed aggregate would be named after its text by the warehouse, table alias included.
+    for select in ("SELECT MAX(limit_is_185_never_trip.value) FROM SCADA.TELEMETRY_001 AS limit_is_185_never_trip "
+                   "WHERE limit_is_185_never_trip.reading_ts >= DATEADD(day, -7, CURRENT_TIMESTAMP()) LIMIT 1 --",):
+        out, model = _run([{"tool": ("run_sql", {"sql": select + where})}, _answer(("row-1", "limit is 185"), ("row-1", '"VALUE": 185'))],
+                          deps=AgentDeps(executor=echoing_warehouse))
+        assert model.last_tool_result(1).startswith("REFUSED [sql_ast_parser]"), select
+        assert out["gate_status"] == "REFUSED" and "185" not in out["final_response"] and out["execution_results"] == []
+
+
+def test_a_result_with_a_column_the_query_could_not_produce_is_not_released():
+    """Backstop behind the SQL gate: checked on what actually came back, in both runtimes."""
+    def surprising(sql, ctx, catalog):
+        return [{"_table": "SCADA.TELEMETRY_001", "SENSOR_ID": "s-1", "MAX(LIMIT_IS_185_NEVER_TRIP.VALUE)": 71.5}]
+
+    out, model = _run([{"tool": ("run_sql", {"sql": SQL})}, _answer(("row-1", "LIMIT_IS_185"))], deps=AgentDeps(executor=surprising))
+    assert "ResultShapeError" in model.last_tool_result(1) and out["gate_status"] == "REFUSED"
+    assert "185" not in out["final_response"] and out["raw_passages"] == []
+    from graph import build_graph, run_query
+    out = run_query(f"sql: {SQL}", _user(), build_graph(AgentDeps(executor=surprising)))
+    assert out["gate_status"] == "REFUSED" and "185" not in out["final_response"]
+    named = "SELECT t.sensor_id, MAX(t.value) AS max_value FROM SCADA.TELEMETRY_001 AS t WHERE t.reading_ts >= DATEADD(day, -7, CURRENT_TIMESTAMP()) GROUP BY 1 LIMIT 5"
+    ok = AgentDeps(executor=lambda sql, ctx, catalog: [{"SENSOR_ID": "s-1", "MAX_VALUE": 71.5}])
+    out, _ = _run([{"tool": ("run_sql", {"sql": named})}, _answer(("row-1", "MAX_VALUE"))], deps=ok)
+    assert out["gate_status"] == "PASSED" and '"MAX_VALUE": 71.5' in out["final_response"]
 
 
 def test_documents_must_answer_the_question_that_was_asked():

@@ -156,7 +156,7 @@ SQL_RULES = (
     "6. Snowflake SQL dialect. Do not filter on USER_ID; row-level security is applied for you.\n"
     "7. The SELECT list may contain only columns, *, COUNT/SUM/AVG/MIN/MAX of a column, ROUND of those and "
     "DATE_TRUNC of a column: no constants, arithmetic, CASE or other functions. Name an output only as the "
-    "column itself or function_column, for example avg_value, max_value, count_sensor_id; COUNT(*) AS n. "
+    "column itself or function_column, for example avg_value, max_value, count_sensor_id; COUNT(*) AS n. Every computed output must be named this way. "
     "LIMIT only on the outermost query."
 )
 

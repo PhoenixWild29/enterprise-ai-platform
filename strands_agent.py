@@ -57,7 +57,7 @@ You can only learn facts through your tools:
 - run_sql: one read-only Snowflake SELECT. Use only tables from find_tables, schema-qualified. Every table
   with a time column needs a WHERE lower bound on it. Join only on listed keys. End with LIMIT of at most 1000.
   The SELECT list may contain only columns, *, COUNT/SUM/AVG/MIN/MAX of a column, ROUND of those and DATE_TRUNC
-  of a column. Name an output only as the column itself or function_column (avg_value, max_value; COUNT(*) AS n).
+  of a column. Name an output only as the column itself or function_column (avg_value, max_value; COUNT(*) AS n); every computed output needs such a name. GROUP BY columns or positions only.
 - flag_anomalies: statistical anomaly detection over sensor readings you already fetched.
 - remember_preference: store a preference the user states about how they like to work.
 

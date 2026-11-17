@@ -22,6 +22,7 @@ from gates import (
     GATE_THIN_SET,
     TOOL_SNOWFLAKE_QUERY,
     SQLSecurityError,
+    check_result_columns,
     payload_safety_gate,
     sql_ast_gate,
     thin_set_refusal_gate,
@@ -164,6 +165,7 @@ class PlatformTools:
 
         try:
             rows = self._deps.executor(secured, ledger.ctx, catalog)
+            check_result_columns(secured, rows, catalog)
         except Exception as err:  # noqa: BLE001 - warehouse messages stay in the server log
             logger.exception("executor.failed")
             ledger.record("sql_executor", "tool_call", f"Execution failed ({type(err).__name__})", GateStatus.REFUSED)

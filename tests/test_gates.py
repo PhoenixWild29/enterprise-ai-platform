@@ -8,7 +8,7 @@ def test_gates():
     print("sqlglot", sqlglot.__version__, "pydantic", pydantic.VERSION, "tables", len(DEFAULT_CATALOG))
     T = "SCADA.TELEMETRY_001"
     ok = [
-        f"SELECT sensor_id, AVG(value) FROM {T} WHERE reading_ts >= DATEADD(day, -7, CURRENT_TIMESTAMP()) GROUP BY 1 LIMIT 100",
+        f"SELECT sensor_id, AVG(value) AS avg_value FROM {T} WHERE reading_ts >= DATEADD(day, -7, CURRENT_TIMESTAMP()) GROUP BY 1 LIMIT 100",
         f"SELECT t.value, e.site_id FROM {T} t JOIN MAINT.EQUIPMENT e ON t.equipment_id = e.equipment_id WHERE t.reading_ts BETWEEN '2026-01-01' AND '2026-02-01' LIMIT 50",
         f"SELECT t.value FROM {T} t JOIN MAINT.WORK_ORDERS_003 w ON t.equipment_id = w.equipment_id WHERE t.reading_ts > '2026-01-01' AND w.opened_at > '2026-01-01' LIMIT 5",
         f"WITH r AS (SELECT equipment_id, value FROM {T} WHERE reading_ts >= '2026-01-01') SELECT * FROM r LIMIT 10",

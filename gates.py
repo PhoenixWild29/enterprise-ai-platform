@@ -386,17 +386,63 @@ def _check_projection_policy(root: exp.Expression) -> None:
             raise SQLValidationError("Parenthesised joins are not allowed; write joins directly in the FROM clause.")
     if root.args.get("offset") is not None or root.args.get("fetch") is not None:
         raise SQLValidationError("OFFSET and FETCH are not allowed; use LIMIT.")
+    for ident in root.find_all(exp.Identifier, exp.Var):
+        if not ident.name.isascii():
+            raise SQLValidationError("Names and keywords must be plain ASCII.")  # look-alike letters fold to real names
+    for group in root.find_all(exp.Group):
+        # GROUPING SETS, ROLLUP and CUBE add rows that do not depend on the data, so an outer
+        # aggregate over them returns a number the author picked.
+        if not _only_args(group, "expressions"):
+            raise SQLValidationError("GROUP BY may list only columns, positions and DATE_TRUNC of a column.")
+        for item in group.expressions:
+            position = isinstance(item, exp.Literal) and item.is_int
+            if not position and _plain_column(item) is None and not (isinstance(item, _TRUNC_TYPES) and _projection_names(item)):
+                raise SQLValidationError("GROUP BY may list only columns, positions and DATE_TRUNC of a column.")
     for select in root.find_all(exp.Select):
         if not _only_args(select, "expressions", "from_", "from", "joins", "where", "group", "having", "order", "limit", "with_", "with", "distinct"):
             raise SQLValidationError("That SELECT clause is not allowed in governed queries.")
+        seen: set[str] = set()
         for projection in select.expressions:
             names = _projection_names(projection.unalias())
             if names is None:
                 raise SQLValidationError(_PROJECTION_RULE)
+            value = projection.unalias()
             alias = projection.alias.lower() if isinstance(projection, exp.Alias) else ""
+            allowed = ", ".join(sorted(names)[:4]) or "no alias"
             if alias and alias not in names:
-                allowed = ", ".join(sorted(names)[:4]) or "no alias"
                 raise SQLValidationError(f"Output name '{alias[:40]}' is not allowed here; use one of: {allowed}.")
+            if not alias and names and _plain_column(value) is None:
+                # An unnamed expression is named after its own text by the warehouse, and that
+                # text includes the author's table alias. So every computed output must be named.
+                raise SQLValidationError(f"Name this output with AS, using one of: {allowed}.")
+            output = alias or _plain_column(value)
+            if output:
+                if output in seen:
+                    raise SQLValidationError(f"Output name '{output}' is used twice.")
+                seen.add(output)
+
+
+class ResultShapeError(RuntimeError):
+    """The warehouse returned a column the validated query could not have produced."""
+
+
+def check_result_columns(sql: str, rows: list[dict[str, Any]], catalog: "Catalog") -> None:
+    """Second line of defence behind the projection policy, applied to what
+    actually came back. Every column in a result must be a catalog column of a
+    table the query reads or one of the query's own (validated, derived)
+    output names. Anything else means the query produced a name the policy
+    did not foresee, and the result is not released."""
+    root = sqlglot.parse_one(sql, read=SQL_DIALECT)
+    allowed = {"_table"}
+    for table in root.find_all(exp.Table):
+        spec = resolve_table(table, catalog)
+        if spec is not None:
+            allowed.update(column.lower() for column in spec.columns)
+    allowed.update(alias.alias.lower() for alias in root.find_all(exp.Alias) if alias.alias)
+    for row in rows:
+        unexpected = [key for key in row if str(key).lower() not in allowed]
+        if unexpected:
+            raise ResultShapeError(f"{len(unexpected)} unexpected output column(s) in the result.")
 
 
 def parse_read_only_sql(sql: str) -> exp.Expression:

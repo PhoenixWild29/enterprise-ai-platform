@@ -45,6 +45,7 @@ from gates import (
     _limit_value,
     _run_gate,
     _table_fqn,
+    check_result_columns,
     citation_gate_node,
     parse_read_only_sql,
     payload_safety_gate_node,
@@ -416,6 +417,7 @@ def make_sql_executor(deps: AgentDeps) -> Callable[[AgentState], dict[str, Any]]
             ctx = _ctx(state)
             secured_sql = apply_row_level_security(state["generated_sql"] or "", ctx, deps.catalog)
             rows = deps.executor(secured_sql, ctx, deps.catalog)
+            check_result_columns(secured_sql, rows, deps.catalog)
         except Exception as err:  # noqa: BLE001 - execution errors never leak partial data
             # Warehouse messages can name objects the caller may not know exist: log them, do not return them.
             logger.exception("executor.failed")
