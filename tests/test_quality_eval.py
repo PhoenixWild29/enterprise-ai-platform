@@ -126,8 +126,11 @@ def test_the_grader_rejects_a_different_answer():
 def test_a_verdict_comes_from_what_actually_ran():
     case, rows, other = BY_ID["t1-02"], [{"N": 58}], [{"N": 3}]
     assert qe.grade(case, rows, PASSED, [rows]).reason == "correct"
-    assert qe.grade(case, rows, PASSED, [other, rows]).reason == "correct"          # an exploratory query first does not spoil the answer
-    assert qe.grade(case, rows, PASSED, [rows, other]).reason == "wrong rows"        # the last statement is the answer, on either runtime
+    assert qe.grade(case, rows, PASSED, [[], rows, rows]).reason == "correct"        # a repeat or an empty probe does not spoil the answer
+    # Two statements with different rows: the grader cannot see which one the answer cited, so neither order is credited.
+    assert qe.grade(case, rows, PASSED, [other, rows]).reason == "ran several different queries"
+    assert qe.grade(case, rows, PASSED, [rows, other]).reason == "ran several different queries"
+    assert qe.grade(case, rows, PASSED, [other]).reason == "wrong rows"
     assert qe.grade(case, rows, PASSED | {"execution_results": rows}, []).reason == "wrong rows"   # nothing ran, so nothing is credited
     assert qe.grade(case, rows, {"gate_status": "REFUSED"}, []).reason == "refused"
     assert qe.grade(case, rows, {"gate_status": "REFUSED"}, [[]]).reason == "ran, then refused"
@@ -239,6 +242,9 @@ def test_the_audit_catches_a_wrong_or_ungradable_reference_answer(monkeypatch):
     assert cut.status == "fail" and "LIMIT 10 cuts the answer" in cut.detail
     unordered = planted(question="How many readings did well pad 001 record in the last 7 days? Largest first", ordered=True)
     assert unordered.status == "fail" and "fewer than two rows" in unordered.detail
+    ordered = BY_ID["t2-05"]                                                           # two orders would both be right
+    assert any("rows tie" in found for found in qe._label_problems(ordered, [{"ID": 4, "V": 4.2}, {"ID": 28, "V": 4.2}, {"ID": 9, "V": 4.1}]))
+    assert not qe._label_problems(ordered, [{"ID": 4, "V": 4.3}, {"ID": 28, "V": 4.2}, {"ID": 9, "V": 4.1}])
     again = planted(question=case.question.upper() + "  ")                             # the same question, differently typed
     assert again.status == "fail" and "duplicate questions: 1" in again.detail
 
@@ -304,6 +310,14 @@ def test_the_audit_does_not_say_ok_for_what_it_did_not_check(monkeypatch):
     # Two models that differ by a single case are not shown to differ.
     close = [_scored("a", cases, lambda c: c.case_id != "t3-01"), _scored("b", cases)]
     assert _audit(monkeypatch, cases, close)["Stronger model scores higher"].status == "warn"
+    # The stronger model has to win on every runtime: an average that hides a reversal is not evidence.
+    split = [_scored("weak", cases, lambda c: c.tier < 2), _scored("weak", cases, runtime="strands"),
+             _scored("strong", cases, lambda c: c.tier < 3), _scored("strong", cases, lambda c: c.tier < 1, runtime="strands")]
+    reversed_ = _audit(monkeypatch, cases, split)["Stronger model scores higher"]
+    assert reversed_.status == "warn" and "disagree" in reversed_.detail
+    # Passing only the must-refuse cases plus a few answers is not "room to improve".
+    few = _scored("few", cases, lambda c: c.expect == "refusal" or c.case_id == "t3-01")
+    assert _audit(monkeypatch, cases, [few])["Headroom"].status == "warn"
     # Held-out questions must exist in every tier; must-refuse cases do not count towards them.
     lopsided = [dataclasses.replace(c, split="heldout" if c.tier <= 1 else "dev") for c in cases if c.tier != 2] + [
         dataclasses.replace(c, split="dev") for c in everything if c.tier == 2]

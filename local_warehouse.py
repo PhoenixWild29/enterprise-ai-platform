@@ -53,8 +53,10 @@ _ROWS: dict[tuple[str, datetime], list[tuple[Any, ...]]] = {}
 def _rows_for(spec: TableSpec, now: datetime) -> list[tuple[Any, ...]]:
     """Deterministic rows for one table, derived only from its name.
 
-    The data is shaped so a wrong query returns a different answer from the
-    right one: history runs well past twice the longest window any question
+    The data is shaped so the planted mistakes in quality_eval.py return a
+    different answer from the right query (the audit checks every one). It
+    does not catch every wrong query: a window that is off by a day can
+    return the same maximum or the same top five. History runs well past twice the longest window any question
     asks about, each table has its own volume and its own mix of row owners,
     and every sensor reports several times a day, so MAX, AVG and MIN differ."""
     key = (spec.fqn, now)

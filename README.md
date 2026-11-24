@@ -59,7 +59,7 @@ output node. A citation failure on the user path pauses for human review.
 | `telemetry.py` | OpenTelemetry export of the audit trail |
 | `anomaly.py` | Classical anomaly detection (robust z-score) for sensor readings |
 | `graph_mail.py` | Mailbox search tools over Microsoft Graph: server-side filters, sequential paging with a caller-bound cursor, counting in code, one message read on request |
-| `quality_eval.py` | Text-to-SQL quality evaluation: 46 questions with known answers, a code grader that compares rows, both runtimes, and an audit of the evaluation itself |
+| `quality_eval.py` | Text-to-SQL quality evaluation: 40 questions with known answers and 6 requests that must be refused, a code grader that compares rows, both runtimes, and an audit of the evaluation itself |
 | `local_warehouse.py` | In-memory DuckDB seeded with deterministic data, so governed SQL really executes and a result can be graded |
 | `agentcore_shared_memory.py` | Shared memory on AgentCore Memory: per-person extraction strategies, shared namespaces written only by an approved promotion, screened recall |
 | `snowflake_backend.py` | Snowflake executor (caller's own OAuth token), catalog loader from Snowflake metadata |
@@ -175,8 +175,7 @@ How answers are read: every answer is over the rows the person asking is entitle
 before now; order is graded only when the question asks for one; extra columns are allowed, missing ones are not; numbers match within
 half a cent. A real model has to be told the time-window convention or it will be marked wrong.
 
-With 46 cases the 95% interval on a score is roughly plus or minus 12 points, and on a single tier of 12 to 14 questions it is 20 or
-more, so each score is printed with its interval.
+With 46 cases the 95% interval on a score is roughly plus or minus 12 points, and on a single tier of 12 to 14 questions it is wider still, so each score is printed with its interval.
 
 **The models in it today are scripted stand-ins**, `example-small` and `example-large`. They know the reference queries and make planned
 mistakes, so the pipeline, the audit and the report can be built and inspected first. Their scores describe the stand-ins, not any model,
@@ -184,7 +183,9 @@ and because both runtimes replay the same script they tie by construction. The n
 
 What the audit cannot tell you: whether the questions are ones people really ask (they are invented, and so is the data), whether a
 question has a second defensible reading it has not thought of, and whether DuckDB and Snowflake agree on every function a real model
-might use. The planted mistakes are five kinds of error, not every way a query can be wrong.
+might use. The planted mistakes are five kinds of error, not every way a query can be wrong: a window that is off by one day still passes on
+some maximum and top-N questions. If a run executes several statements that return different rows the case fails, because the grader
+cannot yet see which rows an answer cited; that needs fixing before a real, tool-looping model is scored.
 
 ## Verification status
 

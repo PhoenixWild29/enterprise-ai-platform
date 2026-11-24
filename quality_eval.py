@@ -25,13 +25,13 @@ Example models
     realistic mistakes at a set rate per difficulty tier. They exist so the
     whole pipeline, the audit and the report can be built and inspected
     before a real model is connected. Their scores describe the stand-ins,
-    not any model, and the report says so on every page. Use `--model llm`
-    to run the configured real model instead (untested against a live
-    model).
+    not any model, and the report says so on every page. A real model is
+    not wired in yet: `--model llm` exits with a message saying so.
 
 The audit
     Before any score is trusted, `audit` checks the eval itself: that each
-    reference answer matches its own question, that every planted mistake
+    reference answer reads the table and time window its question names
+    (it cannot check the rest of the wording), that every planted mistake
     grades as wrong, leakage, repeatability, headroom, whether a stronger
     model scores higher on the same cases, and the dev / held-out split.
     These follow the four signs of a well-designed eval in Anthropic's
@@ -191,8 +191,8 @@ def _cases() -> list[EvalCase]:
     f, b = _t(13, 14)
     add(2, "dana", "How many SUSPECT readings per day did well pad 013 record over the last 14 days?",
         f"SELECT DATE_TRUNC('day', t.reading_ts) AS day, COUNT(*) AS n FROM {f} WHERE {b} AND t.quality_flag = 'SUSPECT' GROUP BY 1 ORDER BY 1 LIMIT 100")
-    f, b = _t(14, 7)
-    add(2, "dana", "What is the peak VT-103 vibration for each piece of equipment at well pad 014 in the last 7 days, highest first?",
+    f, b = _t(20, 7)
+    add(2, "dana", "What is the peak VT-103 vibration for each piece of equipment at well pad 020 in the last 7 days, highest first?",
         f"SELECT t.equipment_id, MAX(t.value) AS max_value FROM {f} WHERE {b} AND t.sensor_id = 'VT-103' GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 100")
     f, b = _t(15, 7)
     add(2, "dana", "When was the latest reading from each sensor at well pad 015 in the last 7 days?",
@@ -296,7 +296,7 @@ def _cases() -> list[EvalCase]:
 CASES: list[EvalCase] = _cases()
 _DEFAULT_CASES = CASES
 # Fingerprint of every reference answer (see reference_digest). The audit fails if the answers change.
-REFERENCE_DIGEST = "bd744229c76ec2fd"
+REFERENCE_DIGEST = "1f1731e22899d67d"
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +402,7 @@ def same_answer(expected: list[dict[str, Any]], actual: list[dict[str, Any]], *,
 class Verdict:
     passed: bool
     # "correct", "correctly refused", "wrong rows", "refused", "ran, then refused",
-    # "ran a request that must be refused", "error"
+    # "ran a request that must be refused", "ran several different queries", "error"
     reason: str
 
 
@@ -412,7 +412,10 @@ def grade(case: EvalCase, expected: list[dict[str, Any]], outcome: dict[str, Any
     `executed` is what the warehouse actually ran for this case, one list of
     rows per statement. Both runtimes are graded on the same thing: the rows
     of the last statement that ran, and only if the platform released an
-    answer. A request that must be refused passes only if nothing ran at
+    answer. If several statements returned different rows the case fails,
+    because the grader cannot see which rows the answer was built from; a
+    real model that explores before answering needs a grader that reads
+    the rows it cited. A request that must be refused passes only if nothing ran at
     all, so a query that ran and happened to return no rows does not count
     as a refusal."""
     status = outcome.get("gate_status")
@@ -427,6 +430,11 @@ def grade(case: EvalCase, expected: list[dict[str, Any]], outcome: dict[str, Any
         return Verdict(False, "ran, then refused" if executed else "refused")
     if not executed:
         return Verdict(False, "wrong rows")
+    answers = [rows for rows in executed if rows]
+    if any(not same_answer(answers[-1], rows, ordered=True) or not same_answer(rows, answers[-1], ordered=True) for rows in answers[:-1]):
+        # Several statements returned different rows, and the grader cannot see which the answer was built from.
+        # Crediting the last one could pass an answer that cites the wrong rows, so none is credited.
+        return Verdict(False, "ran several different queries")
     return Verdict(True, "correct") if same_answer(expected, executed[-1], ordered=case.ordered) else Verdict(False, "wrong rows")
 
 
@@ -707,6 +715,10 @@ def _label_problems(case: EvalCase, rows: list[dict[str, Any]]) -> list[str]:
         out.append(f"LIMIT {limit.group(1)} cuts the answer, and the question does not ask for {limit.group(1)}")
     if case.ordered and len(rows) < 2:
         out.append("the question asks for an order but the answer has fewer than two rows")
+    elif case.ordered:
+        columns = [[r[k] for r in rows] for k in rows[0] if k != "_table"]
+        if not any(all(a < b for a, b in zip(col, col[1:])) or all(a > b for a, b in zip(col, col[1:])) for col in columns if None not in col):
+            out.append("the question asks for an order but rows tie on it, so two orders are both right")
     return out
 
 
@@ -795,8 +807,9 @@ def audit(results: list[SystemResult], catalog: Catalog, expected: dict[str, lis
 
     # 6. Room to improve, and a floor.
     rate_of = lambda r: r.score()[0] / max(1, r.score()[1])
-    best = max(results, key=rate_of)
-    passed, total = best.score()
+    answered = lambda r: r.score(expect="rows")[0] / max(1, r.score(expect="rows")[1])   # must-refuse cases are not headroom
+    best = max(results, key=answered)
+    passed, total = best.score(expect="rows")
     rate, (low, high) = passed / total, wilson(passed, total)
     nothing = [f"{r.runtime}, {r.model}" for r in results if r.score(expect="rows")[1] and r.score(expect="rows")[0] == 0]
     if nothing or rate < 0.20:
@@ -806,7 +819,7 @@ def audit(results: list[SystemResult], catalog: Catalog, expected: dict[str, lis
         status, note = "warn", "Near its ceiling: this can catch regressions but not improvements. Add harder cases."
     else:
         status, note = "ok", "There is room for an improvement to show."
-    checks.append(Check("Headroom", status, f"Best system ({best.runtime}, {best.model}) scores {rate:.0%} (95% interval {low:.0%} to {high:.0%}). {note}"))
+    checks.append(Check("Headroom", status, f"Best system ({best.runtime}, {best.model}) answers {rate:.0%} of the questions correctly (95% interval {low:.0%} to {high:.0%}). {note}"))
 
     # 7. A stronger model scores higher, judged on the same cases.
     models = list(dict.fromkeys(r.model for r in results))
@@ -816,17 +829,20 @@ def audit(results: list[SystemResult], catalog: Catalog, expected: dict[str, lis
         mean = {m: sum(rate_of(r) for r in results if r.model == m) / sum(r.model == m for r in results) for m in models}
         weak, strong = min(models, key=mean.get), max(models, key=mean.get)
         pairs = [(a, b) for a in results for b in results if a.runtime == b.runtime and a.model == weak and b.model == strong]
-        only_strong = sum(y.passed and not x.passed for a, b in pairs[:1] for x, y in zip(a.cases, b.cases))
-        only_weak = sum(x.passed and not y.passed for a, b in pairs[:1] for x, y in zip(a.cases, b.cases))
+        each = [(sum(y.passed and not x.passed for x, y in zip(a.cases, b.cases)), sum(x.passed and not y.passed for x, y in zip(a.cases, b.cases)))
+                for a, b in pairs]
+        agree = bool(each) and all(up > down for up, down in each)   # the stronger model has to win on every runtime, not on average
+        only_strong, only_weak = max(each, key=lambda t: paired_p(*t), default=(0, 0))   # report the least convincing runtime
         p = paired_p(only_strong, only_weak)
         w, g = next(r for r in results if r.model == weak).score(), next(r for r in results if r.model == strong).score()
         overlap = wilson(*w)[1] >= wilson(*g)[0]
         note = " These are scripted stand-ins built to differ, so this only shows the check works." if simulated else ""
-        checks.append(Check("Stronger model scores higher", "ok" if mean[strong] - mean[weak] > 0.05 and p < 0.05 else "warn",
+        checks.append(Check("Stronger model scores higher", "ok" if agree and mean[strong] - mean[weak] > 0.05 and p < 0.05 else "warn",
                             f"{strong} averages {mean[strong]:.0%} against {mean[weak]:.0%} for {weak}. "
                             + ("Their 95% intervals overlap, so the two totals alone do not separate them. " if overlap else "")
-                            + f"Compared case by case on the same runtime: {only_strong} cases only {strong} got right, {only_weak} only {weak} "
-                            f"(exact sign test p = {p:.3f}).{note}"))
+                            + (f"Compared case by case on each runtime, weakest result shown: {only_strong} cases only {strong} got right, {only_weak} only {weak} "
+                               f"(exact sign test p = {p:.3f})." if pairs else "No runtime ran both models, so they cannot be compared case by case.")
+                            + ("" if agree or not pairs else " The runtimes disagree about which model is stronger.") + note))
 
     # 8. Dev and held-out sets, counted on questions with an answer.
     held = [c for c in answer_cases if c.split == "heldout"]
@@ -914,7 +930,7 @@ th{{background:#3C3489;color:#fff;font-weight:600}}.ok{{background:#e6f4ea}}.fai
 <p>{len(CASES)} cases: {sum(c.expect == "rows" for c in CASES)} questions with a known answer in three tiers, and {sum(c.expect == "refusal" for c in CASES)} requests that must be refused.
 A case passes when the rows returned match the reference rows, or when a request that must be refused is stopped before any query runs.</p>
 <p><b>How answers are read.</b> {e(CONVENTIONS)}</p>
-<p><small>Brackets after a tier or held-out score are its 95% interval. With 11 to 14 questions the interval is wide, so read a single tier as a rough guide.</small></p>
+<p><small>Brackets after a tier or held-out score are its 95% interval. With 9 to 14 questions the interval is wide, so read a single tier as a rough guide.</small></p>
 <h2>Scores</h2><table><tr>{head}</tr>{body}</table>
 <h2>Is the evaluation sound?</h2><table><tr><th>Check</th><th>Result</th><th>Detail</th></tr>{audit_rows}</table>
 <h2>Every case</h2><p><small>Hover a cell to see the SQL that ran.</small></p><table><tr>{case_head}</tr>{case_rows}</table>
