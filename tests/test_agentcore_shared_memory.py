@@ -111,6 +111,10 @@ def test_an_episodic_strategy_must_say_where_its_reflections_go():
         assert_actor_scoped([{"customMemoryStrategy": {"name": "C", "namespaceTemplates": own, "configuration": {"episodicOverride": {"extraction": {}}}}}])
     with pytest.raises(ValueError, match="reflection step has no namespace"):
         assert_actor_scoped([{"strategyId": "e-1", "name": "E", "type": "EPISODIC", "namespaces": own}])
+    with pytest.raises(ValueError, match="reflection step has no namespace"):   # GetMemory marks a custom episodic strategy by value only
+        assert_actor_scoped([{"strategyId": "c-1", "name": "C", "type": "CUSTOM", "namespaces": own, "configuration": {"type": "EPISODIC_OVERRIDE"}}])
+    assert_actor_scoped([{"strategyId": "c-2", "name": "Plain", "type": "CUSTOM", "namespaces": own, "configuration": {"type": "SEMANTIC_OVERRIDE"},
+                          "description": "Not about episodic memory, so not treated as episodic"}])
     assert_actor_scoped([{"episodicMemoryStrategy": {"name": "E", "namespaceTemplates": own,
                                                      "reflectionConfiguration": {"namespaceTemplates": ["/users/{actorId}/reflections/"]}}}])
     # Wrappers and tuples are walked: one good strategy cannot vouch for a bad one beside it.

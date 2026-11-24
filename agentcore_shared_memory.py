@@ -149,11 +149,13 @@ def _reflection_steps(node: Any) -> Iterator[dict[str, Any]]:
 
 
 def _mentions(node: Any, word: str) -> bool:
+    """True when `word` appears in any key, or in any string value, of the definition
+    (GetMemory marks a custom episodic strategy only by the value EPISODIC_OVERRIDE)."""
     if isinstance(node, dict):
         return any(word in str(k).lower() or _mentions(v, word) for k, v in node.items())
     if isinstance(node, (list, tuple)):
         return any(_mentions(item, word) for item in node)
-    return False
+    return isinstance(node, str) and re.fullmatch(r"[A-Z_]{1,40}", node) is not None and word in node.lower()  # enum values only, not prose
 
 
 def check_extraction_namespace(template: str) -> None:
@@ -397,6 +399,7 @@ class SharedMemoryGateway:
             code = (getattr(err, "response", None) or {}).get("Error", {}).get("Code")
             if code != "ResourceNotFoundException":
                 raise
+            logger.warning("memory.unpublish.not_found record_id=%s memory_record_id=%s", record.record_id, record.published_id)
         logger.info("memory.unpublished record_id=%s memory_record_id=%s", record.record_id, record.published_id)
 
     def retract(self, record: MemoryRecord, reviewer: AuthContext) -> None:

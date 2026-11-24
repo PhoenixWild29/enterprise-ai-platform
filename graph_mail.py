@@ -82,7 +82,7 @@ _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 # marks and tag characters, surrogates, private use, unassigned, line and paragraph separators),
 # plus variation selectors and the blank "filler" letters that have ordinary categories.
 _HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
-_HIDDEN_EXTRA = frozenset({0x034F, 0x115F, 0x1160, 0x3164, 0x2800, 0xFFA0}) | set(range(0xFE00, 0xFE10)) | set(range(0xE0100, 0xE01F0))
+_HIDDEN_EXTRA = frozenset({0x034F, 0x115F, 0x1160, 0x3164, 0x2800, 0xFFA0, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x180F}) | set(range(0xFE00, 0xFE10)) | set(range(0xE0100, 0xE01F0))
 
 
 def _visible(text: str, *, keep_newlines: bool = False) -> str:
