@@ -36,7 +36,7 @@ import unicodedata
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from html import escape
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -330,9 +330,15 @@ def _actor_id(principal: str) -> str:
 
 
 class MemoryService:
-    def __init__(self, store: MemoryStore | None = None, policy: MemoryPolicy | None = None) -> None:
+    def __init__(
+        self, store: MemoryStore | None = None, policy: MemoryPolicy | None = None,
+        publisher: Callable[[MemoryRecord], object] | None = None,
+    ) -> None:
         self.store = store or InMemoryStore()
         self.policy = policy or MemoryPolicy()
+        # Called with an approved shared record, to publish it where every replica can read it
+        # (agentcore_shared_memory.SharedMemoryGateway.promote). Approval stands only if it succeeds.
+        self.publisher = publisher
 
     def remember(
         self, ctx: AuthContext, text: str, scope: MemoryScope = MemoryScope.USER,
@@ -370,6 +376,13 @@ class MemoryService:
         updated = record.model_copy(update={
             "status": MemoryStatus.ACTIVE if approve else MemoryStatus.REJECTED, "approved_by": reviewer.principal,
         })
+        if approve and self.publisher is not None:
+            try:
+                self.publisher(updated)
+            except MemoryRefused:
+                raise
+            except Exception as err:  # noqa: BLE001 - an unpublished approval would be active here and absent everywhere else
+                raise MemoryRefused(f"The approval could not be published ({type(err).__name__}); the proposal is still pending.") from err
         self.store.put(updated)
         return updated
 
