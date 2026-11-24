@@ -28,14 +28,19 @@ promotion role should be the only one allowed to write them.
 
 Request shapes here are checked in the tests against the service model
 that ships with boto3. Nothing in this module has been run against the
-live service.
+live service. The recall screen is a pattern filter: it stops obvious
+secrets and instructions, not a carefully reworded one, which is why the
+structural rules above carry the weight.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
+import unicodedata
 from datetime import UTC, datetime
-from typing import Any, Callable, Protocol
+from itertools import zip_longest
+from typing import Any, Iterator, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -52,6 +57,9 @@ SHARED_PREFIX = "/shared/"
 DEFAULT_EVENT_EXPIRY_DAYS = 90
 MAX_QUERY_CHARS = 1000
 MAX_RECALLED = 8
+MIN_RECORD_EXPIRY_DAYS = 31      # the service's minimum for a record expiry
+_REQUEST_ID = re.compile(r"[a-zA-Z0-9_-]{1,80}")
+_NAMESPACE_KEYS = ("namespaces", "namespaceTemplates")
 
 
 class MemoryDataClient(Protocol):
@@ -89,25 +97,57 @@ def memory_strategies(*, facts: bool = False) -> list[dict[str, Any]]:
     return strategies
 
 
+def _namespace_lists(node: Any) -> Iterator[str]:
+    """Every namespace a strategy definition names, at any depth. Custom and
+    episodic strategies carry more of them inside their configuration (a
+    reflection step writes to its own namespaces), so the whole definition
+    is walked instead of a list of known places."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _NAMESPACE_KEYS:
+                if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                    raise ValueError("A strategy's namespaces must be a list of strings.")
+                yield from value
+            else:
+                yield from _namespace_lists(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _namespace_lists(item)
+
+
+def check_extraction_namespace(template: str) -> None:
+    """One namespace an extraction strategy may write to. It must be a path
+    whose first segment is a fixed name other than `shared`, with the actor
+    as a whole segment of its own: /users/{actorId}/preferences/ passes,
+    /shared/org/, /{actorId}/x/ and /team-{actorId}/ do not."""
+    if not (template.startswith("/") and template.endswith("/")):
+        raise ValueError(f"Namespace '{template}' needs a leading and a trailing slash.")
+    segments = template[1:-1].split("/")
+    plain_first = bool(segments[0]) and "{" not in segments[0] and segments[0].lower() != SHARED_PREFIX.strip("/")
+    if not plain_first or "{actorId}" not in segments or any(seg in ("", ".", "..") for seg in segments):
+        raise ValueError(
+            f"Extraction namespace '{template}' is not scoped to one actor. Automatic extraction must never write shared memory."
+        )
+
+
 def assert_actor_scoped(strategies: list[dict[str, Any]]) -> None:
     """Refuse a strategy that could extract into a namespace more than one
-    person reads. This is the check to run in CI against the deployed
-    configuration, not only against this module's own output."""
+    person reads. Accepts strategies as written for CreateMemory
+    ({"semanticMemoryStrategy": {...}}) and as returned by GetMemory (flat,
+    with `type` and `namespaces`), so the same check can run in CI against
+    what is actually deployed."""
     for strategy in strategies:
-        for kind, definition in strategy.items():
-            templates = list(definition.get("namespaceTemplates") or []) + list(definition.get("namespaces") or [])
-            reflection = definition.get("reflectionConfiguration") or {}
-            templates += list(reflection.get("namespaceTemplates") or []) + list(reflection.get("namespaces") or [])
-            if not templates:
-                raise ValueError(f"{kind} '{definition.get('name')}' has no namespace; the default may be shared.")
-            for template in templates:
-                if "{actorId}" not in template or template.startswith(SHARED_PREFIX):
-                    raise ValueError(
-                        f"{kind} '{definition.get('name')}' extracts into '{template}', which is not scoped to one actor. "
-                        "Automatic extraction must never write shared memory."
-                    )
-                if not (template.startswith("/") and template.endswith("/")):
-                    raise ValueError(f"Namespace '{template}' needs a leading and a trailing slash.")
+        if not isinstance(strategy, dict):
+            raise ValueError("Each strategy must be an object.")
+        name = strategy.get("name") or next((v.get("name") for v in strategy.values() if isinstance(v, dict) and v.get("name")), "?")
+        namespaces = list(_namespace_lists(strategy))
+        if not namespaces:
+            raise ValueError(f"Strategy '{name}' has no namespace; the default may be shared.")
+        for template in namespaces:
+            try:
+                check_extraction_namespace(template)
+            except ValueError as err:
+                raise ValueError(f"Strategy '{name}': {err}") from err
 
 
 def create_memory_request(
@@ -135,15 +175,20 @@ def create_memory_request(
 
 def actor_id(principal: str) -> str:
     """The AgentCore actor for a person. Use the same value for CreateEvent,
-    so extraction files their memory where `readable_namespaces` looks."""
+    so extraction files their memory where `readable_namespaces` looks. It
+    must come from the verified token: if a client or a model can choose it,
+    one person can write into another's memory."""
     return _actor_id(principal)
 
 
 def persona_slug(role: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-")
-    if not slug:
+    """A namespace segment for one exact role. Roles that differ only in case
+    or punctuation are different roles, so a digest of the exact name is
+    part of the segment and two roles can never share memory by accident."""
+    if not role or not role.strip():
         raise MemoryRefused("Persona has no usable name.")
-    return slug[:60]
+    readable = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-")[:40] or "role"
+    return f"{readable}-{hashlib.sha256(role.encode()).hexdigest()[:10]}"
 
 
 def shared_namespace(scope: MemoryScope, owner: str) -> str:
@@ -164,10 +209,19 @@ def readable_namespaces(ctx: AuthContext, *, facts: bool = False) -> list[tuple[
     own = [(MemoryScope.USER, USER_PREFERENCES_TEMPLATE.format(actorId=actor))]
     if facts:
         own.append((MemoryScope.USER, USER_FACTS_TEMPLATE.format(actorId=actor)))
-    return own + [
-        (MemoryScope.PERSONA, shared_namespace(MemoryScope.PERSONA, ctx.snowflake_role)),
-        (MemoryScope.ORG, ORG_NAMESPACE),
-    ]
+    try:
+        persona = [(MemoryScope.PERSONA, shared_namespace(MemoryScope.PERSONA, ctx.snowflake_role))]
+    except MemoryRefused:
+        persona = []  # no usable role: no persona memory, rather than no memory at all
+    return own + persona + [(MemoryScope.ORG, ORG_NAMESPACE)]
+
+
+def _same_person(a: str, b: str) -> bool:
+    def fold(value: str) -> str:
+        text = unicodedata.normalize("NFKC", value)
+        return "".join(ch for ch in text if unicodedata.category(ch) != "Cf").strip().casefold()
+
+    return fold(a) == fold(b)
 
 
 # ---------------------------------------------------------------------------
@@ -196,67 +250,104 @@ class SharedMemoryGateway:
         """Memory relevant to `query` from every namespace the caller may
         read. A namespace that cannot be read is skipped, never widened.
         Anything that fails the write policy today is dropped, including
-        records that were extracted automatically and never saw that policy."""
+        records that were extracted automatically and never saw that policy.
+        The result takes turns between namespaces, so a person's own memory
+        cannot crowd out what the organisation has approved."""
         query = " ".join(query.split())[:MAX_QUERY_CHARS]
         if not query:
             return []
-        recalled: list[RecalledMemory] = []
+        found: list[list[RecalledMemory]] = []
         for scope, namespace in readable_namespaces(ctx, facts=self._facts):
             try:
                 response = self._client.retrieve_memory_records(
-                    memoryId=self._memory_id, namespace=namespace,
-                    searchCriteria={"searchQuery": query, "topK": max(1, min(per_namespace, 10))},
+                    memoryId=self._memory_id, namespace=namespace,  # `namespace` is an exact match; `namespacePath` would be a prefix
+                    searchCriteria={"searchQuery": query, "topK": max(1, min(int(per_namespace), 10))},
                 )
+                summaries = response.get("memoryRecordSummaries") or []
+                if not isinstance(summaries, list):
+                    raise TypeError("memoryRecordSummaries is not a list")
             except Exception as err:  # noqa: BLE001 - memory is a convenience; a failed read is not a failed request
                 logger.warning("memory.recall.failed scope=%s error=%s", scope.value, type(err).__name__)
                 continue
-            for summary in response.get("memoryRecordSummaries") or []:
-                # A record is used only if it lives exactly where we asked. If the service ever
-                # matches more broadly than the namespace given, nothing extra gets through.
-                if namespace not in (summary.get("namespaces") or []):
-                    continue
-                text = self._screen(str((summary.get("content") or {}).get("text") or ""))
-                if text:
-                    recalled.append(RecalledMemory(
-                        scope=scope, text=text, memory_record_id=str(summary.get("memoryRecordId", "")), score=summary.get("score"),
-                    ))
-        return recalled[:MAX_RECALLED]
+            kept: list[RecalledMemory] = []
+            for summary in summaries:
+                try:
+                    # Belt and braces: a record is used only if it is filed exactly where we asked.
+                    filed = summary.get("namespaces")
+                    if not isinstance(filed, list) or namespace not in filed:
+                        continue
+                    text = self._screen(str((summary.get("content") or {}).get("text") or ""))
+                    score = summary.get("score")
+                    if text:
+                        kept.append(RecalledMemory(scope=scope, text=text, memory_record_id=str(summary.get("memoryRecordId", "")),
+                                                   score=float(score) if isinstance(score, (int, float)) else None))
+                except Exception as err:  # noqa: BLE001 - one malformed record is skipped, the rest are kept
+                    logger.warning("memory.recall.skipped scope=%s error=%s", scope.value, type(err).__name__)
+            found.append(kept)
+        turns = [record for group in zip_longest(*found) for record in group if record is not None]
+        return turns[:MAX_RECALLED]
 
-    def promote(self, record: MemoryRecord, *, now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> str:
+    def promote(self, record: MemoryRecord) -> str:
         """Write one approved proposal to its shared namespace and return the
-        AgentCore record id. This is the only path into shared memory, and it
-        re-checks the approval rather than trusting its caller."""
+        AgentCore record id. This is the only code path into shared memory.
+
+        It refuses a record that is not consistent with an approval (wrong
+        scope, not active, expired, no approver, approver same as author),
+        but it cannot know whether the named approver really approved: that
+        is decided in MemoryService.review, which checks the reviewer's own
+        verified identity and then calls this. Use it only as that hook, and
+        give write access on /shared/ to nothing else."""
         if record.scope not in (MemoryScope.PERSONA, MemoryScope.ORG):
             raise MemoryRefused("Only persona and organisation memory is promoted to a shared namespace.")
-        if record.status is not MemoryStatus.ACTIVE or not record.approved_by:
+        if record.status is not MemoryStatus.ACTIVE or not (record.approved_by or "").strip():
             raise MemoryRefused("Shared memory must be approved before it is published.")
-        if record.approved_by.casefold() == record.author.casefold():
+        if _same_person(record.approved_by, record.author):
             raise MemoryRefused("Shared memory needs a second person's approval.")
+        if not record.is_live():
+            raise MemoryRefused("This proposal has expired; propose it again.")
+        if not _REQUEST_ID.fullmatch(record.record_id):
+            raise MemoryRefused("The record id is not usable as a request identifier.")
         text = self._policy.check_text(record.text)
         namespace = shared_namespace(record.scope, record.owner)
+        days_left = (record.expires_at - datetime.now(UTC)).days
         response = self._client.batch_create_memory_records(
             memoryId=self._memory_id,
-            records=[{"requestIdentifier": record.record_id, "namespaces": [namespace], "content": {"text": text}, "timestamp": now()}],
-            clientToken=f"promote-{record.record_id}",  # a retried approval does not write the record twice
+            # The record's own creation time, so a retried approval sends an identical request under the same token.
+            records=[{"requestIdentifier": record.record_id, "namespaces": [namespace], "content": {"text": text},
+                      "timestamp": record.created_at}],
+            clientToken=f"promote-{record.record_id}",
+            recordExpirySpecification={"recordExpiryDurationDays": max(MIN_RECORD_EXPIRY_DAYS, days_left)},  # a union: one key only
         )
         failed = response.get("failedRecords") or []
-        written = [r for r in response.get("successfulRecords") or [] if r.get("requestIdentifier") == record.record_id]
+        written = [r for r in response.get("successfulRecords") or []
+                   if r.get("requestIdentifier") == record.record_id and r.get("status") == "SUCCEEDED" and r.get("memoryRecordId")]
         if failed or not written:
             raise MemoryRefused("The shared memory store did not accept the record; it remains unpublished.")
         memory_record_id = str(written[0]["memoryRecordId"])
-        # Who wrote it and who approved it stay in the platform's own log, joined on this id.
         logger.info("memory.promoted record_id=%s memory_record_id=%s scope=%s author=%s approved_by=%s",
                     record.record_id, memory_record_id, record.scope.value, record.author, record.approved_by)
         return memory_record_id
 
-    def retract(self, memory_record_id: str, reviewer: AuthContext) -> None:
+    def unpublish(self, record: MemoryRecord) -> None:
+        """Delete a published record from its shared namespace. This is the
+        hook for MemoryService(retractor=...), which has already decided the
+        caller may delete it. The namespace is sent because IAM can only
+        authorise the delete by namespace when it is given."""
+        if not record.published_id or record.scope not in (MemoryScope.PERSONA, MemoryScope.ORG):
+            raise MemoryRefused("That entry is not published to shared memory.")
+        self._client.delete_memory_record(
+            memoryId=self._memory_id, memoryRecordId=record.published_id, namespace=shared_namespace(record.scope, record.owner),
+        )
+        logger.info("memory.unpublished record_id=%s memory_record_id=%s", record.record_id, record.published_id)
+
+    def retract(self, record: MemoryRecord, reviewer: AuthContext) -> None:
         """Remove a shared record that turned out to be wrong. Admins only."""
         from memory import REVIEWER_SNOWFLAKE_ROLE
 
         if reviewer.auth_path is not AuthPath.USER_OBO or reviewer.snowflake_role != REVIEWER_SNOWFLAKE_ROLE:
             raise MemoryRefused("Only a platform admin can retract shared memory.")
-        self._client.delete_memory_record(memoryId=self._memory_id, memoryRecordId=memory_record_id)
-        logger.info("memory.retracted memory_record_id=%s by=%s", memory_record_id, reviewer.principal)
+        self.unpublish(record)
+        logger.info("memory.retracted memory_record_id=%s by=%s", record.published_id, reviewer.principal)
 
     def _screen(self, text: str) -> str | None:
         try:

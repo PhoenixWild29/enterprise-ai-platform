@@ -28,6 +28,7 @@ persists USER and SESSION entries in Amazon Bedrock AgentCore Memory.
 """
 
 import hashlib
+import logging
 import json
 import re
 import secrets
@@ -42,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from auth import AuthContext, AuthPath
 
+logger = logging.getLogger("platform.memory")
 MAX_MEMORY_CHARS = 500
 # How many live entries one owner may hold. Without a cap, memory grows without
 # bound and every entry is more text carried into every later prompt.
@@ -87,6 +89,7 @@ class MemoryRecord(BaseModel):
     author: str
     trace_id: str | None = None
     approved_by: str | None = None
+    published_id: str | None = Field(default=None, description="Id of the record in the shared store, once published")
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     expires_at: datetime
 
@@ -318,10 +321,14 @@ def _mixes_scripts(word: str) -> bool:
 
 
 def _actor_id(principal: str) -> str:
-    """AgentCore actor ids are restricted to a safe character set. A short
-    digest keeps two principals that differ only in punctuation apart."""
-    digest = hashlib.sha256(principal.encode()).hexdigest()[:12]
-    return f"{re.sub(r'[^A-Za-z0-9_-]', '_', principal)[:100]}-{digest}"
+    """The AgentCore actor for a principal. Actor ids must start with a letter
+    or digit and use a small character set, so the readable part is
+    sanitised and prefixed. Sign-in names are not case-sensitive, so the
+    principal is case-folded first: one person is one actor. A short digest
+    keeps two principals that differ only in punctuation apart."""
+    folded = unicodedata.normalize("NFKC", principal).strip().casefold()
+    digest = hashlib.sha256(folded.encode()).hexdigest()[:12]
+    return f"u-{re.sub(r'[^a-z0-9_-]', '_', folded)[:100]}-{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +340,17 @@ class MemoryService:
     def __init__(
         self, store: MemoryStore | None = None, policy: MemoryPolicy | None = None,
         publisher: Callable[[MemoryRecord], object] | None = None,
+        retractor: Callable[[MemoryRecord], object] | None = None,
     ) -> None:
         self.store = store or InMemoryStore()
         self.policy = policy or MemoryPolicy()
-        # Called with an approved shared record, to publish it where every replica can read it
-        # (agentcore_shared_memory.SharedMemoryGateway.promote). Approval stands only if it succeeds.
+        # publisher: called with an approved shared record, to publish it where every replica can
+        # read it (agentcore_shared_memory.SharedMemoryGateway.promote). It returns the published id,
+        # which is kept on the record. Approval stands only if publishing succeeds.
+        # retractor: removes a published record (SharedMemoryGateway.unpublish), so that deleting
+        # here deletes there, and a publish whose local write then fails is undone.
         self.publisher = publisher
+        self.retractor = retractor
 
     def remember(
         self, ctx: AuthContext, text: str, scope: MemoryScope = MemoryScope.USER,
@@ -378,11 +390,24 @@ class MemoryService:
         })
         if approve and self.publisher is not None:
             try:
-                self.publisher(updated)
+                published = self.publisher(updated)
             except MemoryRefused:
                 raise
             except Exception as err:  # noqa: BLE001 - an unpublished approval would be active here and absent everywhere else
                 raise MemoryRefused(f"The approval could not be published ({type(err).__name__}); the proposal is still pending.") from err
+            if isinstance(published, str) and published:
+                updated = updated.model_copy(update={"published_id": published})
+            try:
+                self.store.put(updated)
+            except Exception:
+                # Published but not recorded: take it back, so the two stores never disagree about what is shared.
+                if self.retractor is not None and updated.published_id:
+                    try:
+                        self.retractor(updated)
+                    except Exception:  # noqa: BLE001
+                        logger.error("memory.publish.orphaned record_id=%s published_id=%s", updated.record_id, updated.published_id)
+                raise
+            return updated
         self.store.put(updated)
         return updated
 
@@ -405,6 +430,13 @@ class MemoryService:
             return
         if record.author != ctx.principal and ctx.snowflake_role != REVIEWER_SNOWFLAKE_ROLE:
             raise MemoryRefused("You can only delete memory you wrote.")
+        if record.published_id:
+            if self.retractor is None:
+                raise MemoryRefused("This entry is published to shared memory and cannot be removed from here.")
+            try:
+                self.retractor(record)  # delete where it is served from first; only then forget it locally
+            except Exception as err:  # noqa: BLE001
+                raise MemoryRefused(f"The shared entry could not be removed ({type(err).__name__}); it is unchanged.") from err
         self.store.delete(record_id)
 
     def pending_review(self, reviewer: AuthContext) -> list[MemoryRecord]:
