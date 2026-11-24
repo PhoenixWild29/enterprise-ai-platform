@@ -142,7 +142,7 @@ def test_agentcore_store_persists_user_memory_and_reloads_it_safely():
     kept = memory.remember(DANA, "I prefer metric units")
     memory.remember(DANA, "Shared note for the ops persona to review", scope=MemoryScope.PERSONA)
     actor = client.events[0]["actorId"]
-    assert len(client.events) == 1 and actor.startswith("dana_ops_contoso_com-") and client.events[0]["memoryId"] == "mem-1"
+    assert len(client.events) == 1 and actor.startswith("u-dana_ops_contoso_com-") and client.events[0]["memoryId"] == "mem-1"
     from memory import _actor_id
     assert _actor_id("dana.ops@contoso.com") != _actor_id("dana_ops@contoso_com")  # punctuation variants do not share an actor
 

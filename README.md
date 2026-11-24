@@ -58,6 +58,8 @@ output node. A citation failure on the user path pauses for human review.
 | `mcp_server.py` | MCP server exposing the gated tools with bearer-token authentication |
 | `telemetry.py` | OpenTelemetry export of the audit trail |
 | `anomaly.py` | Classical anomaly detection (robust z-score) for sensor readings |
+| `graph_mail.py` | Mailbox search tools over Microsoft Graph: server-side filters, sequential paging with a caller-bound cursor, counting in code, one message read on request |
+| `agentcore_shared_memory.py` | Shared memory on AgentCore Memory: per-person extraction strategies, shared namespaces written only by an approved promotion, screened recall |
 | `snowflake_backend.py` | Snowflake executor (caller's own OAuth token), catalog loader from Snowflake metadata |
 | `retrieval.py` | Vector index, offline embedder, Snowflake Cortex vector retriever |
 | `runtime.py` | Assembles agents, warehouse, retriever and catalog from the environment |
@@ -126,6 +128,9 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 - Joins between two tables that share a foreign key (including a table joined to itself) pass the key check, so SUM or COUNT over one can be inflated by row fan-out. The values still come from table data.
 - Derived output names (`n`, `day`, `max_value`) assume the catalog has no real column with the same name. The demo catalog has none; a catalog loaded from Snowflake is not checked for this yet.
 - Selected column names are not resolved against the catalog; an unknown name fails in the warehouse rather than at the gate.
+- A mail search's next links must stay on exactly the path the search started on. If Graph returns a differently spelled path for a folder (for example `mailFolders('inbox')`), inbox and sent searches would stop at the second page with a refusal. This fails loudly, not silently, and needs checking in a tenant.
+- The mail tools are standalone: they are not yet registered on the Strands agent, and mail is not citable evidence in an answer. Cursors and message handles are held per process.
+- Shared memory promotion is wired to the review step (`MemoryService(publisher=...)`) but the AgentCore entrypoint does not use it yet. Provenance (author, approver) is logged and kept on the platform's own record, joined by the published id; it is not yet written to the AgentCore record's metadata. That platform record, with its published id, is held in process today, so after a restart a published entry can no longer be removed through `forget`; a durable store for shared proposals is needed before this is used for real. `promote` checks that a record is consistent with an approval, not that the approval happened: only `MemoryService.review` does that, so nothing else should be able to call it or write `/shared/`. The IAM policy that makes a namespace an access boundary is described in the notes for CNX, not in the Terraform.
 - Relevance is checked for documents only. Whether returned rows answer the question is not checked on either runtime.
 - The MCP server accepts any valid token for the platform API; it has no audience of its own yet, so a token for one is good for the other.
 - Scheduled jobs on AgentCore need the optional `idtyp` claim enabled on the Entra app registration; without it they are refused.
@@ -147,6 +152,8 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 | Bedrock adapter | Request shape, metering and budgets tested against a stubbed boto3 client. Not yet called against Bedrock |
 | AgentCore Identity and Memory adapters | Call shapes tested against fakes built from the SDK's signatures. Not yet run against the services |
 | MCP server | Tools exercised through the MCP SDK in-process, including authentication. Not yet placed behind AgentCore Gateway |
+| Mail tools | Paging, throttling, cursors and refusals tested against a fake Graph service. Not yet run against Microsoft Graph or a real mailbox. The text-search syntax needs checking in a tenant, and the AgentCore Identity token provider for Graph is untested |
+| AgentCore shared memory | Request shapes validated against the service model shipped with boto3. Not yet run against AgentCore Memory. Reads use the exact-match `namespace` parameter (not the hierarchical `namespacePath`), and recall also checks each record's namespace itself |
 | Terraform | Written from the AWS provider documentation. Never validated, planned or applied. IAM action names and resource ARNs for AgentCore Identity are unverified |
 | Entra provider | RS256 validation tested with a generated key pair; the JWKS download and MSAL calls are faked. Not yet run against a real tenant |
 | Model-backed agents and LLM judge | Logic tested with scripted completions. Not yet run against a live model |
