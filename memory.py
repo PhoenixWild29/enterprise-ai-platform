@@ -326,7 +326,7 @@ def _actor_id(principal: str) -> str:
     sanitised and prefixed. Sign-in names are not case-sensitive, so the
     principal is case-folded first: one person is one actor. A short digest
     keeps two principals that differ only in punctuation apart."""
-    folded = unicodedata.normalize("NFKC", principal).strip().casefold()
+    folded = unicodedata.normalize("NFKC", principal).strip().lower()
     digest = hashlib.sha256(folded.encode()).hexdigest()[:12]
     return f"u-{re.sub(r'[^a-z0-9_-]', '_', folded)[:100]}-{digest}"
 
@@ -401,11 +401,15 @@ class MemoryService:
                 self.store.put(updated)
             except Exception:
                 # Published but not recorded: take it back, so the two stores never disagree about what is shared.
+                orphaned = bool(updated.published_id)
                 if self.retractor is not None and updated.published_id:
                     try:
                         self.retractor(updated)
+                        orphaned = False
                     except Exception:  # noqa: BLE001
-                        logger.error("memory.publish.orphaned record_id=%s published_id=%s", updated.record_id, updated.published_id)
+                        pass
+                if orphaned:  # needs an operator: a shared record exists that no local record points at
+                    logger.error("memory.publish.orphaned record_id=%s published_id=%s", updated.record_id, updated.published_id)
                 raise
             return updated
         self.store.put(updated)

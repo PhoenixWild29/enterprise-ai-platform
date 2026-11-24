@@ -41,6 +41,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from collections import Counter, OrderedDict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable, Literal
@@ -76,10 +77,19 @@ MAX_HANDLES_PER_CALLER = 5000
 
 _ADDRESS = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}")
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
-# Control characters, line and paragraph separators, and invisible format characters (zero-width
-# joiners, bidirectional overrides). Mail is written by outsiders; none of these may shape what
-# the model reads.
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]")
+# Mail is written by outsiders, so nothing invisible may shape what the model reads. Characters
+# are removed by Unicode category (controls, format characters such as zero-width joiners, bidi
+# marks and tag characters, surrogates, private use, unassigned, line and paragraph separators),
+# plus variation selectors and the blank "filler" letters that have ordinary categories.
+_HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+_HIDDEN_EXTRA = frozenset({0x034F, 0x115F, 0x1160, 0x3164, 0x2800, 0xFFA0}) | set(range(0xFE00, 0xFE10)) | set(range(0xE0100, 0xE01F0))
+
+
+def _visible(text: str, *, keep_newlines: bool = False) -> str:
+    return "".join(
+        ch if (keep_newlines and ch == "\n") or not (unicodedata.category(ch) in _HIDDEN_CATEGORIES or ord(ch) in _HIDDEN_EXTRA) else " "
+        for ch in text
+    )
 # The mail tools log their own events. httpx would also log every request URL at INFO, and those
 # URLs carry search text, sender addresses and message ids.
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -138,7 +148,7 @@ class MailQuery(BaseModel):
     def _plain_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        cleaned = " ".join(_CONTROL.sub(" ", value).replace('"', " ").replace("\\", " ").split())  # stays one quoted phrase
+        cleaned = " ".join(_visible(value).replace('"', " ").replace("\\", " ").split())  # stays one quoted phrase
         return cleaned or None
 
     @model_validator(mode="after")
@@ -212,11 +222,16 @@ def _sender(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sender_address(message: dict[str, Any]) -> str:
-    return _clean(_sender(message).get("address"), 254).lower()
+    """The sender's address, or a placeholder. Only a plain address is ever
+    shown: anything else in this field is text an outsider chose."""
+    address = str(_sender(message).get("address") or "").strip().lower()
+    if not address:
+        return ""
+    return address if len(address) <= 254 and _ADDRESS.fullmatch(address) else "(malformed sender)"
 
 
 def _clean(value: Any, limit: int) -> str:
-    return " ".join(_CONTROL.sub(" ", str(value or "")).split())[:limit]
+    return " ".join(_visible(str(value or "")).split())[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -300,8 +315,9 @@ def _require_graph_url(url: str, path: str | None = None) -> None:
     the same parser that sends the request, and refuses anything that parser
     would rewrite (dot segments), so what is checked is what is fetched."""
     raw = str(url)
-    lowered = raw.lower()
-    if raw != raw.strip() or "\\" in raw or "/../" in raw or "/./" in raw or "%2e" in lowered or raw.endswith(("/..", "/.")) or len(raw) > 8000:
+    route = raw.split("?", 1)[0].split("#", 1)[0]   # dot segments matter in the path; a query value may contain anything
+    if (raw != raw.strip() or "\\" in raw or len(raw) > 8000
+            or "/../" in route or "/./" in route or "%2e" in route.lower() or route.endswith(("/..", "/."))):
         raise MailLinkRefused("Refused to follow a link outside Microsoft Graph.")
     try:
         parsed = httpx.URL(raw)
@@ -426,7 +442,7 @@ class MailPage(BaseModel):
 class MailSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["complete", "truncated", "partial"]
+    status: Literal["complete", "service_limit", "truncated", "partial"]
     exact: bool
     messages_counted: int
     group_by: Literal["sender", "day", "conversation"]
@@ -603,6 +619,7 @@ def summarize_mail(
     top = _whole(top, 20, 1, 50)
     exact = status == "complete" and not query.text
     if status == "complete" and query.text:
+        status = "service_limit"
         note = (f"{seen} message(s) counted from what the mail service returned. A text search returns at most about "
                 f"{SEARCH_RESULT_CAP} results, so this is a lower bound; narrow the dates for an exact total.")
     return MailSummary(
@@ -622,7 +639,7 @@ def read_mail(client: GraphMailClient, store: MailSessionStore, caller: str, han
         client.start(), text_body=True,
     )
     body = message.get("body") if isinstance(message.get("body"), dict) else {}
-    text = re.sub(r"[^\S\n]+", " ", _CONTROL.sub(lambda m: "\n" if m.group() == "\n" else " ", str(body.get("content") or ""))).strip()
+    text = re.sub(r"[^\S\n]+", " ", _visible(str(body.get("content") or ""), keep_newlines=True)).strip()
     max_chars = _whole(max_chars, MAX_BODY_CHARS, 200, MAX_BODY_CHARS)
     row = _row(store, caller, message | {"bodyPreview": ""})
     return {"handle": row.handle, "received": row.received, "sender": row.sender, "subject": row.subject,

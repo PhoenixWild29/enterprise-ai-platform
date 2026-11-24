@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import unicodedata
 from datetime import UTC, datetime
@@ -110,9 +111,49 @@ def _namespace_lists(node: Any) -> Iterator[str]:
                 yield from value
             else:
                 yield from _namespace_lists(value)
-    elif isinstance(node, list):
+    elif isinstance(node, (list, tuple)):
         for item in node:
             yield from _namespace_lists(item)
+
+
+def _strategy_definitions(node: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Each strategy in a configuration as (kind, definition), whether it is
+    written for CreateMemory ({"semanticMemoryStrategy": {...}}), returned by
+    GetMemory (flat, with `type`) or wrapped for UpdateMemory
+    ({"addMemoryStrategies": [...]})."""
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _strategy_definitions(item)
+    elif isinstance(node, dict):
+        if "name" in node or "strategyId" in node or "memoryStrategyId" in node:
+            yield str(node.get("type") or ""), node
+            return
+        for key, value in node.items():
+            if isinstance(value, dict) and key.endswith("MemoryStrategy"):
+                yield key, value
+            else:
+                yield from _strategy_definitions(value)
+    else:
+        raise ValueError("Each strategy must be an object.")
+
+
+def _reflection_steps(node: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("reflectionConfiguration", "reflection") and isinstance(value, dict):
+                yield value
+            yield from _reflection_steps(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _reflection_steps(item)
+
+
+def _mentions(node: Any, word: str) -> bool:
+    if isinstance(node, dict):
+        return any(word in str(k).lower() or _mentions(v, word) for k, v in node.items())
+    if isinstance(node, (list, tuple)):
+        return any(_mentions(item, word) for item in node)
+    return False
 
 
 def check_extraction_namespace(template: str) -> None:
@@ -136,13 +177,24 @@ def assert_actor_scoped(strategies: list[dict[str, Any]]) -> None:
     ({"semanticMemoryStrategy": {...}}) and as returned by GetMemory (flat,
     with `type` and `namespaces`), so the same check can run in CI against
     what is actually deployed."""
-    for strategy in strategies:
-        if not isinstance(strategy, dict):
-            raise ValueError("Each strategy must be an object.")
-        name = strategy.get("name") or next((v.get("name") for v in strategy.values() if isinstance(v, dict) and v.get("name")), "?")
-        namespaces = list(_namespace_lists(strategy))
-        if not namespaces:
+    definitions = list(_strategy_definitions(strategies))
+    if strategies and not definitions:
+        raise ValueError("No strategy definitions were found to check.")
+    for kind, definition in definitions:
+        name = definition.get("name") or "?"
+        own = [ns for key in _NAMESPACE_KEYS for ns in (definition.get(key) or [])] if all(
+            isinstance(definition.get(key) or [], (list, tuple)) for key in _NAMESPACE_KEYS) else None
+        namespaces = list(_namespace_lists(definition))
+        if own is None:
+            raise ValueError("A strategy's namespaces must be a list of strings.")
+        if not own:
             raise ValueError(f"Strategy '{name}' has no namespace; the default may be shared.")
+        if "episodic" in kind.lower() or _mentions(definition, "episodic"):
+            # An episodic strategy also runs a reflection step, which can draw on many sessions and
+            # writes to namespaces of its own. Left unset, where those land is the service's choice.
+            steps = list(_reflection_steps(definition))
+            if not steps or any(not list(_namespace_lists(step)) for step in steps):
+                raise ValueError(f"Strategy '{name}' is episodic and its reflection step has no namespace; the default may be shared.")
         for template in namespaces:
             try:
                 check_extraction_namespace(template)
@@ -309,14 +361,15 @@ class SharedMemoryGateway:
             raise MemoryRefused("The record id is not usable as a request identifier.")
         text = self._policy.check_text(record.text)
         namespace = shared_namespace(record.scope, record.owner)
-        days_left = (record.expires_at - datetime.now(UTC)).days
+        # From the record's own dates, not the clock, so a retried approval sends an identical request.
+        lifetime_days = math.ceil((record.expires_at - record.created_at).total_seconds() / 86400)
         response = self._client.batch_create_memory_records(
             memoryId=self._memory_id,
             # The record's own creation time, so a retried approval sends an identical request under the same token.
             records=[{"requestIdentifier": record.record_id, "namespaces": [namespace], "content": {"text": text},
                       "timestamp": record.created_at}],
             clientToken=f"promote-{record.record_id}",
-            recordExpirySpecification={"recordExpiryDurationDays": max(MIN_RECORD_EXPIRY_DAYS, days_left)},  # a union: one key only
+            recordExpirySpecification={"recordExpiryDurationDays": max(MIN_RECORD_EXPIRY_DAYS, lifetime_days)},  # a union: one key only
         )
         failed = response.get("failedRecords") or []
         written = [r for r in response.get("successfulRecords") or []
@@ -335,9 +388,15 @@ class SharedMemoryGateway:
         authorise the delete by namespace when it is given."""
         if not record.published_id or record.scope not in (MemoryScope.PERSONA, MemoryScope.ORG):
             raise MemoryRefused("That entry is not published to shared memory.")
-        self._client.delete_memory_record(
-            memoryId=self._memory_id, memoryRecordId=record.published_id, namespace=shared_namespace(record.scope, record.owner),
-        )
+        try:
+            self._client.delete_memory_record(
+                memoryId=self._memory_id, memoryRecordId=record.published_id, namespace=shared_namespace(record.scope, record.owner),
+            )
+        except Exception as err:  # noqa: BLE001
+            # Already gone (retracted, expired, or removed by an operator) is the outcome that was asked for.
+            code = (getattr(err, "response", None) or {}).get("Error", {}).get("Code")
+            if code != "ResourceNotFoundException":
+                raise
         logger.info("memory.unpublished record_id=%s memory_record_id=%s", record.record_id, record.published_id)
 
     def retract(self, record: MemoryRecord, reviewer: AuthContext) -> None:
