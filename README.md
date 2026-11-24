@@ -156,12 +156,35 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 | Use | Regression gate in CI | Comparing models, prompts and agent designs |
 
 `python quality_eval.py` runs both runtimes on the same questions against a local warehouse and writes `reports/quality_eval.html`.
-Before reporting a score it audits itself: reference answers reproduce and are not empty, nothing leaks into a prompt, the grader gives
-the same verdict twice, the best score leaves headroom, a stronger model scores higher, and there is a held-out set.
+Both are graded on the same thing: the rows of the last statement that actually ran, and only if the platform released an answer.
+A request that must be refused passes only if no query ran at all.
+
+Before reporting a score it audits itself:
+
+- every reference answer has rows, reads the table and the time window its question names, and is not cut short by a `LIMIT`
+- the reference answers match a fingerprint recorded with the cases, so the seeded data is the same on every machine
+- every planted mistake (wrong table, missing condition, wrong aggregate, wrong window, wrong order) grades as wrong, and the right
+  answer still passes with its rows shuffled and its columns renamed
+- no question or reference query appears in any file a model reads
+- every case gets the same verdict on a second run
+- the best score leaves headroom, and a system that answers nothing is called out
+- a stronger model scores higher, judged case by case on the same questions
+- there are held-out questions in every tier
+
+How answers are read: every answer is over the rows the person asking is entitled to see; "the last N days" means the N times 24 hours
+before now; order is graded only when the question asks for one; extra columns are allowed, missing ones are not; numbers match within
+half a cent. A real model has to be told the time-window convention or it will be marked wrong.
+
+With 46 cases the 95% interval on a score is roughly plus or minus 12 points, and on a single tier of 12 to 14 questions it is 20 or
+more, so each score is printed with its interval.
 
 **The models in it today are scripted stand-ins**, `example-small` and `example-large`. They know the reference queries and make planned
 mistakes, so the pipeline, the audit and the report can be built and inspected first. Their scores describe the stand-ins, not any model,
 and because both runtimes replay the same script they tie by construction. The numbers mean nothing until a real model is connected.
+
+What the audit cannot tell you: whether the questions are ones people really ask (they are invented, and so is the data), whether a
+question has a second defensible reading it has not thought of, and whether DuckDB and Snowflake agree on every function a real model
+might use. The planted mistakes are five kinds of error, not every way a query can be wrong.
 
 ## Verification status
 
@@ -175,7 +198,7 @@ and because both runtimes replay the same script they tie by construction. The n
 | MCP server | Tools exercised through the MCP SDK in-process, including authentication. Not yet placed behind AgentCore Gateway |
 | Mail tools | Paging, throttling, cursors and refusals tested against a fake Graph service. Not yet run against Microsoft Graph or a real mailbox. The text-search syntax needs checking in a tenant, and the AgentCore Identity token provider for Graph is untested |
 | AgentCore shared memory | Request shapes validated against the service model shipped with boto3. Not yet run against AgentCore Memory. Reads use the exact-match `namespace` parameter (not the hierarchical `namespacePath`), and recall also checks each record's namespace itself |
-| Quality evaluation | The warehouse, grader, audit and report are tested, including that the audit catches planted bugs. It has only been run with scripted stand-in models; no real model has been scored, so it has not yet answered the single-agent versus supervisor question |
+| Quality evaluation | The warehouse, grader, audit and report are tested: every planted wrong query must grade as wrong, and the audit is tested against planted faults in the labels, the data, the prompts and the split. It has only been run with scripted stand-in models and invented questions on DuckDB; no real model has been scored, so it has not yet answered the single-agent versus supervisor question |
 | Terraform | Written from the AWS provider documentation. Never validated, planned or applied. IAM action names and resource ARNs for AgentCore Identity are unverified |
 | Entra provider | RS256 validation tested with a generated key pair; the JWKS download and MSAL calls are faked. Not yet run against a real tenant |
 | Model-backed agents and LLM judge | Logic tested with scripted completions. Not yet run against a live model |
