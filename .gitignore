@@ -7,3 +7,4 @@ eval_report.json
 .data/
 deploy/*.json
 deploy/*.jsonl
+reports/
