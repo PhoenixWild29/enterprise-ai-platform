@@ -120,7 +120,7 @@ def select_schema_context(
     for spec in catalog.tables.values():
         if allowed_domains is not None and spec.domain not in allowed_domains:
             continue
-        vocab = _words(f"{spec.schema_name} {spec.name} {' '.join(spec.columns)}")
+        vocab = _words(f"{spec.schema_name} {spec.name} {' '.join(spec.columns)} {spec.description}")
         score = len(q & vocab) + 2 * len(q & _DOMAIN_HINTS[spec.domain])
         if score:
             scored.append((score, spec.fqn, spec))
@@ -136,6 +136,8 @@ def select_schema_context(
 
 def describe_table(spec: TableSpec) -> str:
     parts = [f"{spec.fqn} ({', '.join(spec.columns)})", f"primary key: {', '.join(spec.primary_key)}"]
+    if spec.description:
+        parts.insert(1, f"holds: {spec.description}")
     for fk in spec.foreign_keys:
         parts.append(f"foreign key: {fk.column} -> {fk.ref_table}.{fk.ref_column}")
     if spec.time_column:

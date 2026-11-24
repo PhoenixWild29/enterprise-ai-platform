@@ -112,6 +112,7 @@ class TableSpec(_Strict):
         default=None, description="Column that every query on this table must bound"
     )
     is_sensor: bool = Field(default=False, description="High-volume telemetry table")
+    description: str = Field(default="", max_length=300, description="What the table holds, in business terms")
 
     @field_validator("schema_name", "name")
     @classmethod

@@ -1,3 +1,5 @@
 -r requirements.txt
 # tests
 pytest>=8
+# local SQL engine for the quality evaluation (quality_eval.py)
+duckdb>=1.1

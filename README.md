@@ -59,6 +59,8 @@ output node. A citation failure on the user path pauses for human review.
 | `telemetry.py` | OpenTelemetry export of the audit trail |
 | `anomaly.py` | Classical anomaly detection (robust z-score) for sensor readings |
 | `graph_mail.py` | Mailbox search tools over Microsoft Graph: server-side filters, sequential paging with a caller-bound cursor, counting in code, one message read on request |
+| `quality_eval.py` | Text-to-SQL quality evaluation: 46 questions with known answers, a code grader that compares rows, both runtimes, and an audit of the evaluation itself |
+| `local_warehouse.py` | In-memory DuckDB seeded with deterministic data, so governed SQL really executes and a result can be graded |
 | `agentcore_shared_memory.py` | Shared memory on AgentCore Memory: per-person extraction strategies, shared namespaces written only by an approved promotion, screened recall |
 | `snowflake_backend.py` | Snowflake executor (caller's own OAuth token), catalog loader from Snowflake metadata |
 | `retrieval.py` | Vector index, offline embedder, Snowflake Cortex vector retriever |
@@ -131,6 +133,7 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 - A mail search's next links must stay on exactly the path the search started on. If Graph returns a differently spelled path for a folder (for example `mailFolders('inbox')`), inbox and sent searches would stop at the second page with a refusal. This fails loudly, not silently, and needs checking in a tenant.
 - The mail tools are standalone: they are not yet registered on the Strands agent, and mail is not citable evidence in an answer. Cursors and message handles are held per process.
 - Shared memory promotion is wired to the review step (`MemoryService(publisher=...)`) but the AgentCore entrypoint does not use it yet. Provenance (author, approver) is logged and kept on the platform's own record, joined by the published id; it is not yet written to the AgentCore record's metadata. That platform record, with its published id, is held in process today, so after a restart a published entry can no longer be removed through `forget`; a durable store for shared proposals is needed before this is used for real. `promote` checks that a record is consistent with an approval, not that the approval happened: only `MemoryService.review` does that, so nothing else should be able to call it or write `/shared/`. The IAM policy that makes a namespace an access boundary is described in the notes for CNX, not in the Terraform.
+- The quality evaluation's questions and data are invented, 46 cases give wide intervals (roughly plus or minus 12 points), and a real model is not wired in (`--model llm` exits with a message). The local warehouse is DuckDB, not Snowflake: the SQL is translated, so a query that behaves differently on Snowflake would not be caught here.
 - Relevance is checked for documents only. Whether returned rows answer the question is not checked on either runtime.
 - The MCP server accepts any valid token for the platform API; it has no audience of its own yet, so a token for one is good for the other.
 - Scheduled jobs on AgentCore need the optional `idtyp` claim enabled on the Entra app registration; without it they are refused.
@@ -141,6 +144,24 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 - An approved answer is returned to the reviewer's call; the original requester has no endpoint to fetch it.
 - The token vault is per process, so a run resumed on another replica cannot reach the warehouse and is refused.
 - The SQL policy is an allow-list over what sqlglot parses. It has been attacked by three review passes, not formally verified, and has never been run against a real Snowflake account.
+
+## Two evaluations, two questions
+
+| | `eval_harness.py` | `quality_eval.py` |
+| --- | --- | --- |
+| Question | Do the gates hold? | How often is the answer right? |
+| Expected score | 100%, always | Well below 100%, so an improvement can show |
+| Cases | Mostly attacks a reviewer found | Questions with a known answer, in three tiers, plus requests that must be refused |
+| Grader | Gate outcome and node path | The rows returned, compared in code with the reference rows |
+| Use | Regression gate in CI | Comparing models, prompts and agent designs |
+
+`python quality_eval.py` runs both runtimes on the same questions against a local warehouse and writes `reports/quality_eval.html`.
+Before reporting a score it audits itself: reference answers reproduce and are not empty, nothing leaks into a prompt, the grader gives
+the same verdict twice, the best score leaves headroom, a stronger model scores higher, and there is a held-out set.
+
+**The models in it today are scripted stand-ins**, `example-small` and `example-large`. They know the reference queries and make planned
+mistakes, so the pipeline, the audit and the report can be built and inspected first. Their scores describe the stand-ins, not any model,
+and because both runtimes replay the same script they tie by construction. The numbers mean nothing until a real model is connected.
 
 ## Verification status
 
@@ -154,6 +175,7 @@ curl -s -X POST localhost:8000/v1/query -H "authorization: Bearer $TOKEN" \
 | MCP server | Tools exercised through the MCP SDK in-process, including authentication. Not yet placed behind AgentCore Gateway |
 | Mail tools | Paging, throttling, cursors and refusals tested against a fake Graph service. Not yet run against Microsoft Graph or a real mailbox. The text-search syntax needs checking in a tenant, and the AgentCore Identity token provider for Graph is untested |
 | AgentCore shared memory | Request shapes validated against the service model shipped with boto3. Not yet run against AgentCore Memory. Reads use the exact-match `namespace` parameter (not the hierarchical `namespacePath`), and recall also checks each record's namespace itself |
+| Quality evaluation | The warehouse, grader, audit and report are tested, including that the audit catches planted bugs. It has only been run with scripted stand-in models; no real model has been scored, so it has not yet answered the single-agent versus supervisor question |
 | Terraform | Written from the AWS provider documentation. Never validated, planned or applied. IAM action names and resource ARNs for AgentCore Identity are unverified |
 | Entra provider | RS256 validation tested with a generated key pair; the JWKS download and MSAL calls are faked. Not yet run against a real tenant |
 | Model-backed agents and LLM judge | Logic tested with scripted completions. Not yet run against a live model |
